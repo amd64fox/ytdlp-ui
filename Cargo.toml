@@ -1,0 +1,15 @@
+[package]
+name = "ytdlp_gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+arboard = "3.3"
+regex = "1"
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+zip = "0.6"
+
+# --- ДЛЯ КОНФИГА ---
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"  # <--- Используем TOML вместо JSON
