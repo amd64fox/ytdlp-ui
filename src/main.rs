@@ -399,19 +399,6 @@ impl eframe::App for YtDlpApp {
             }
         }
 
-        // --- ГЛОБАЛЬНАЯ ОБРАБОТКА CTRL+V ---
-        if ctx.input_mut(|i| {
-            i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::CTRL,
-                egui::Key::V,
-            ))
-        }) {
-            if let Ok(mut clipboard) = Clipboard::new() {
-                if let Ok(text) = clipboard.get_text() {
-                    ctx.output_mut(|o| o.copied_text = text);
-                }
-            }
-        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(5.0);
@@ -542,7 +529,7 @@ impl eframe::App for YtDlpApp {
                     );
 
                     egui::ScrollArea::vertical()
-                        .id_source("components_scroll")
+                        .id_salt("components_scroll")
                         .max_height(80.0)
                         .min_scrolled_height(80.0)
                         .show(ui, |ui| {
@@ -681,7 +668,7 @@ impl eframe::App for YtDlpApp {
                             .rounding(4.0)
                             .show(ui, |ui| {
                                 egui::ScrollArea::vertical()
-                                    .id_source("url_list")
+                                    .id_salt("url_list")
                                     .auto_shrink([false, true])
                                     .max_height(list_h)
                                     .show(ui, |ui| {
@@ -897,6 +884,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "YouTube Downloader",
         options,
-        Box::new(|cc| Box::new(YtDlpApp::new(cc))),
+        Box::new(|cc| Ok(Box::new(YtDlpApp::new(cc)))),
     )
 }
