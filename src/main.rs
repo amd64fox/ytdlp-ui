@@ -2,12 +2,13 @@
 
 mod updater;
 
+use encoding_rs::WINDOWS_1251;
 use eframe::egui;
 use std::env;
 use std::fs::{self};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -17,6 +18,61 @@ use serde::{Deserialize, Serialize};
 
 // --- КОНФИГУРАЦИЯ ---
 const CONFIG_FILE: &str = "config.toml";
+const APP_CONFIG_DIR: &str = "ytdlp-ui";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
+    r"C:\Windows\Fonts\consola.ttf",
+    r"C:\Windows\Fonts\CascadiaMono.ttf",
+    r"C:\Windows\Fonts\cour.ttf",
+    r"C:\Windows\Fonts\lucon.ttf",
+];
+
+fn current_app_dir() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .map_or_else(
+            || PathBuf::from("."),
+            |mut path| {
+                path.pop();
+                path
+            },
+        )
+}
+
+fn resolve_config_path(app_dir: &Path) -> PathBuf {
+    if env::var_os("YTDLP_UI_PORTABLE").is_some() {
+        return app_dir.join(CONFIG_FILE);
+    }
+
+    if let Some(base_dir) = env::var_os("LOCALAPPDATA").or_else(|| env::var_os("APPDATA")) {
+        return PathBuf::from(base_dir).join(APP_CONFIG_DIR).join(CONFIG_FILE);
+    }
+
+    app_dir.join(CONFIG_FILE)
+}
+
+fn configure_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    if let Some(font_bytes) = WINDOWS_MONOSPACE_FONT_CANDIDATES
+        .iter()
+        .find_map(|path| fs::read(path).ok())
+    {
+        let font_name = "windows-monospace".to_string();
+        fonts.font_data.insert(
+            font_name.clone(),
+            egui::FontData::from_owned(font_bytes).into(),
+        );
+
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, font_name);
+    }
+
+    ctx.set_fonts(fonts);
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct AppConfig {
@@ -26,13 +82,8 @@ struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let mut video_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-        video_path.pop();
-        video_path.push("Video");
-        let _ = fs::create_dir_all(&video_path);
-
         Self {
-            output_path: video_path.to_string_lossy().to_string(),
+            output_path: String::new(),
             yt_dlp_args: vec![
                 "--sponsorblock-remove sponsor,selfpromo".to_string(),
                 "--format bestvideo[height<=1080]+bestaudio/best[height<=1080]/best".to_string(),
@@ -44,22 +95,76 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    fn load() -> Self {
-        if let Ok(content) = fs::read_to_string(CONFIG_FILE) {
-            if let Ok(cfg) = toml::from_str::<AppConfig>(&content) {
-                let _ = fs::create_dir_all(&cfg.output_path);
-                return cfg;
-            }
+    fn default_for(app_dir: &Path) -> (Self, Vec<String>) {
+        let video_path = app_dir.join("Video");
+        let mut messages = Vec::new();
+
+        if let Err(err) = fs::create_dir_all(&video_path) {
+            messages.push(format!(
+                ">>> Не удалось создать папку загрузок {}: {err}",
+                video_path.display()
+            ));
         }
-        let cfg = Self::default();
-        cfg.save();
-        cfg
+
+        (
+            Self {
+                output_path: video_path.to_string_lossy().to_string(),
+                ..Self::default()
+            },
+            messages,
+        )
     }
 
-    fn save(&self) {
-        if let Ok(content) = toml::to_string_pretty(self) {
-            let _ = fs::write(CONFIG_FILE, content);
+    fn load(config_path: &Path, app_dir: &Path) -> (Self, Vec<String>) {
+        let mut messages = Vec::new();
+
+        match fs::read_to_string(config_path) {
+            Ok(content) => match toml::from_str::<AppConfig>(&content) {
+                Ok(cfg) => {
+                    if let Err(err) = fs::create_dir_all(&cfg.output_path) {
+                        messages.push(format!(
+                            ">>> Не удалось подготовить папку загрузок {}: {err}",
+                            cfg.output_path
+                        ));
+                    }
+                    return (cfg, messages);
+                }
+                Err(err) => {
+                    messages.push(format!(
+                        ">>> Конфиг {} поврежден, будет создан новый: {err}",
+                        config_path.display()
+                    ));
+                }
+            },
+            Err(err) if err.kind() != ErrorKind::NotFound => {
+                messages.push(format!(
+                    ">>> Не удалось прочитать конфиг {}: {err}",
+                    config_path.display()
+                ));
+            }
+            Err(_) => {}
         }
+
+        let (cfg, default_messages) = Self::default_for(app_dir);
+        messages.extend(default_messages);
+
+        if let Err(err) = cfg.save(config_path) {
+            messages.push(format!(
+                ">>> Не удалось сохранить конфиг {}: {err}",
+                config_path.display()
+            ));
+        }
+
+        (cfg, messages)
+    }
+
+    fn save(&self, config_path: &Path) -> Result<(), String> {
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+
+        let content = toml::to_string_pretty(self).map_err(|err| err.to_string())?;
+        fs::write(config_path, content).map_err(|err| err.to_string())
     }
 }
 
@@ -129,9 +234,8 @@ struct YtDlpApp {
     logs: String,
 
     is_working: bool,
-    show_url_window: bool,
+    show_url_editor: bool,
     show_update_confirm: bool,
-    center_url_window_on_open: bool,
     center_confirm_window_on_open: bool,
 
     receiver: Receiver<AppMessage>,
@@ -139,63 +243,120 @@ struct YtDlpApp {
     component_states: Vec<updater::ComponentInfo>,
     updating_component: Option<String>,
     app_dir: PathBuf,
+    config_path: PathBuf,
 }
 
 impl YtDlpApp {
-    fn url_manager_viewport_id() -> egui::ViewportId {
-        egui::ViewportId::from_hash_of("url_manager_viewport")
-    }
-
     fn update_confirm_viewport_id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("update_confirm_viewport")
     }
 
-    fn spawn_update_check(sender: Sender<AppMessage>, ctx: egui::Context, app_dir: PathBuf) {
+    fn send_log(sender: &Sender<AppMessage>, ctx: &egui::Context, message: impl Into<String>) {
+        let _ = sender.send(AppMessage::Log(message.into()));
+        ctx.request_repaint();
+    }
+
+    fn decode_process_line(bytes: &[u8]) -> String {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => text.to_owned(),
+            Err(_) => {
+                let (decoded, _, _) = WINDOWS_1251.decode(bytes);
+                decoded.into_owned()
+            }
+        }
+    }
+
+    fn spawn_pipe_reader<R>(
+        reader: R,
+        sender: Sender<AppMessage>,
+        ctx: egui::Context,
+        prefix: &'static str,
+    ) -> thread::JoinHandle<()>
+    where
+        R: Read + Send + 'static,
+    {
         thread::spawn(move || {
-            match updater::check_for_updates(&app_dir, env!("CARGO_PKG_VERSION")) {
-                Ok(states) => {
-                    let _ = sender.send(AppMessage::UpdateSnapshot(states));
-                }
-                Err(err) => {
-                    let _ = sender.send(AppMessage::Log(format!("Err update check: {}", err)));
+            let mut reader = BufReader::new(reader);
+            let mut buffer = Vec::new();
+
+            loop {
+                buffer.clear();
+
+                match reader.read_until(b'\n', &mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+                            buffer.pop();
+                        }
+
+                        let line = Self::decode_process_line(&buffer);
+                        let rendered = if prefix.is_empty() {
+                            line
+                        } else {
+                            format!("{prefix}{line}")
+                        };
+                        Self::send_log(&sender, &ctx, rendered);
+                    }
+                    Err(err) => {
+                        Self::send_log(
+                            &sender,
+                            &ctx,
+                            format!("❌ Ошибка чтения вывода процесса: {err}"),
+                        );
+                        break;
+                    }
                 }
             }
+        })
+    }
+
+    fn managed_yt_dlp_path(&self) -> PathBuf {
+        self.app_dir.join("yt-dlp.exe")
+    }
+
+    fn spawn_update_check(sender: Sender<AppMessage>, ctx: egui::Context, app_dir: PathBuf) {
+        thread::spawn(move || {
+            let report = updater::check_for_updates(&app_dir);
+            for warning in report.warnings {
+                Self::send_log(&sender, &ctx, warning);
+            }
+            let _ = sender.send(AppMessage::UpdateSnapshot(report.components));
             ctx.request_repaint();
         });
     }
 
     fn new(cc: &eframe::CreationContext) -> Self {
         let (sender, receiver) = channel();
-        let config = AppConfig::load();
+        let app_dir = current_app_dir();
+        let config_path = resolve_config_path(&app_dir);
+        let (config, config_messages) = AppConfig::load(&config_path, &app_dir);
         let ctx = cc.egui_ctx.clone();
+        let mut logs = String::new();
 
-        // ПРИМЕНЯЕМ СТИЛЬ ЗДЕСЬ
+        configure_fonts(&ctx);
         configure_global_style(&ctx);
 
-        let app_dir = env::current_exe()
-            .ok()
-            .and_then(|mut p| {
-                p.pop();
-                Some(p)
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
+        for message in config_messages {
+            logs.push_str(&message);
+            logs.push('\n');
+        }
 
         Self::spawn_update_check(sender.clone(), ctx, app_dir.clone());
 
         Self {
             urls: vec![String::new()],
             config,
-            logs: String::new(),
+            logs,
             is_working: false,
-            show_url_window: false,
+            show_url_editor: false,
             show_update_confirm: false,
-            center_url_window_on_open: false,
             center_confirm_window_on_open: false,
             receiver,
             sender,
             component_states: Vec::new(),
             updating_component: None,
             app_dir,
+            config_path,
         }
     }
 
@@ -242,8 +403,29 @@ impl YtDlpApp {
     }
 
     fn start_download(&mut self, ctx: &egui::Context) {
-        let _ = fs::create_dir_all(&self.config.output_path);
-        self.config.save();
+        if let Err(err) = fs::create_dir_all(&self.config.output_path) {
+            self.logs.push_str(&format!(
+                ">>> Не удалось создать папку загрузок {}: {err}\n",
+                self.config.output_path
+            ));
+            return;
+        }
+
+        if let Err(err) = self.config.save(&self.config_path) {
+            self.logs.push_str(&format!(
+                ">>> Не удалось сохранить конфиг {}: {err}\n",
+                self.config_path.display()
+            ));
+            return;
+        }
+
+        let yt_dlp_path = self.managed_yt_dlp_path();
+        if !yt_dlp_path.is_file() {
+            self.logs
+                .push_str(">>> yt-dlp.exe не найден. Сначала установите его через кнопку обновления.\n");
+            return;
+        }
+
         let valid_urls: Vec<String> = self
             .urls
             .iter()
@@ -260,52 +442,87 @@ impl YtDlpApp {
         self.logs
             .push_str(&format!(">>> Старт: {} файл(ов)\n", total));
         let path = self.config.output_path.clone();
+        let yt_dlp_path = yt_dlp_path.clone();
         let config_args = self.config.yt_dlp_args.clone();
         let sender = self.sender.clone();
         let thread_ctx = ctx.clone();
         thread::spawn(move || {
             let clean_path = path.trim_end_matches('\\');
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
             for (i, url) in valid_urls.iter().enumerate() {
-                let _ = sender.send(AppMessage::Log(format!(
+                Self::send_log(&sender, &thread_ctx, format!(
                     ">>> [{}/{}] {}",
                     i + 1,
                     total,
                     url
-                )));
-                thread_ctx.request_repaint();
-                let output_template = format!(r"{}/%(title)s.%(ext)s", clean_path);
+                ));
+                let output_template = format!(r"{clean_path}/%(title)s.%(ext)s");
                 let mut args = vec!["--newline".to_string()];
-                for arg_line in config_args.iter() {
+                for arg_line in &config_args {
                     for part in arg_line.split_whitespace() {
                         args.push(part.to_string());
                     }
                 }
                 args.push("-o".to_string());
                 args.push(output_template);
-                args.push(url.to_string());
-                let child = Command::new("yt-dlp")
+                args.push(url.clone());
+                let child = Command::new(&yt_dlp_path)
                     .args(&args)
+                    .env("PYTHONUTF8", "1")
+                    .env("PYTHONIOENCODING", "utf-8")
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .creation_flags(CREATE_NO_WINDOW)
                     .spawn();
                 match child {
                     Ok(mut child_process) => {
-                        if let Some(stdout) = child_process.stdout.take() {
-                            let reader = BufReader::new(stdout);
-                            for line in reader.lines() {
-                                if let Ok(l) = line {
-                                    let _ = sender.send(AppMessage::Log(l));
-                                    thread_ctx.request_repaint();
+                        let stdout_handle = child_process.stdout.take().map(|stdout| {
+                            Self::spawn_pipe_reader(
+                                stdout,
+                                sender.clone(),
+                                thread_ctx.clone(),
+                                "",
+                            )
+                        });
+                        let stderr_handle = child_process.stderr.take().map(|stderr| {
+                            Self::spawn_pipe_reader(
+                                stderr,
+                                sender.clone(),
+                                thread_ctx.clone(),
+                                "stderr | ",
+                            )
+                        });
+
+                        match child_process.wait() {
+                            Ok(status) => {
+                                if let Some(handle) = stdout_handle {
+                                    let _ = handle.join();
+                                }
+                                if let Some(handle) = stderr_handle {
+                                    let _ = handle.join();
+                                }
+
+                                if !status.success() {
+                                    let exit_code = status
+                                        .code()
+                                        .map_or_else(|| "без кода".to_string(), |code| code.to_string());
+                                    Self::send_log(
+                                        &sender,
+                                        &thread_ctx,
+                                        format!("❌ yt-dlp завершился с кодом {exit_code}"),
+                                    );
                                 }
                             }
+                            Err(err) => {
+                                Self::send_log(
+                                    &sender,
+                                    &thread_ctx,
+                                    format!("❌ Не удалось дождаться завершения yt-dlp: {err}"),
+                                );
+                            }
                         }
-                        let _ = child_process.wait();
                     }
                     Err(e) => {
-                        let _ = sender.send(AppMessage::Log(format!("❌ Ошибка: {}", e)));
-                        thread_ctx.request_repaint();
+                        Self::send_log(&sender, &thread_ctx, format!("❌ Ошибка запуска yt-dlp: {e}"));
                     }
                 }
             }
@@ -325,11 +542,11 @@ impl YtDlpApp {
         let thread_ctx = ctx.clone();
         let app_dir = self.app_dir.clone();
         thread::spawn(move || {
-            for component in to_update.iter() {
+            for component in &to_update {
                 let _ = sender.send(AppMessage::UpdatingComponent(Some(component.title.clone())));
                 match updater::install_component(&app_dir, component) {
                     Ok(updater::InstallResult::Installed(msg)) => {
-                        let _ = sender.send(AppMessage::Log(format!("✅ {}", msg)));
+                        let _ = sender.send(AppMessage::Log(format!("✅ {msg}")));
                     }
                     Err(err) => {
                         let _ = sender
@@ -340,9 +557,11 @@ impl YtDlpApp {
             }
             let _ = sender.send(AppMessage::UpdatingComponent(None));
             let _ = sender.send(AppMessage::Log("✅ Обновление завершено.".to_string()));
-            if let Ok(states) = updater::check_for_updates(&app_dir, env!("CARGO_PKG_VERSION")) {
-                let _ = sender.send(AppMessage::UpdateSnapshot(states));
+            let report = updater::check_for_updates(&app_dir);
+            for warning in report.warnings {
+                Self::send_log(&sender, &thread_ctx, warning);
             }
+            let _ = sender.send(AppMessage::UpdateSnapshot(report.components));
             let _ = sender.send(AppMessage::AllFinished);
             thread_ctx.request_repaint();
         });
@@ -376,6 +595,293 @@ impl YtDlpApp {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 3.0, color); // Чуть меньше точка
     }
+
+    fn draw_button_with_icon(
+        ui: &mut egui::Ui,
+        text: &str,
+        min_size: egui::Vec2,
+        icon: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(min_size, egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact(&response);
+            let painter = ui.painter();
+            let rounding = egui::Rounding::same(4.0);
+
+            painter.rect_filled(rect, rounding, visuals.bg_fill);
+            painter.rect_stroke(rect, rounding, visuals.bg_stroke);
+
+            let icon_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.left() + 16.0, rect.center().y),
+                egui::vec2(14.0, 14.0),
+            );
+            icon(painter, icon_rect, visuals.fg_stroke.color);
+
+            painter.text(
+                egui::pos2(icon_rect.right() + 8.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                text,
+                egui::TextStyle::Button.resolve(ui.style()),
+                visuals.fg_stroke.color,
+            );
+        }
+
+        response
+    }
+
+    fn draw_icon_only_button(
+        ui: &mut egui::Ui,
+        size: egui::Vec2,
+        icon: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+    ) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+
+        if ui.is_rect_visible(rect) {
+            let visuals = ui.style().interact(&response);
+            let painter = ui.painter();
+            let rounding = egui::Rounding::same(4.0);
+
+            painter.rect_filled(rect, rounding, visuals.bg_fill);
+            painter.rect_stroke(rect, rounding, visuals.bg_stroke);
+
+            let icon_rect = rect.shrink2(egui::vec2(7.0, 7.0));
+            icon(painter, icon_rect, visuals.fg_stroke.color);
+        }
+
+        response
+    }
+
+    fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.8, color);
+        let center_y = rect.center().y;
+        let left = rect.left();
+        let right = rect.right();
+
+        painter.line_segment(
+            [egui::pos2(left, center_y), egui::pos2(right, center_y)],
+            stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(left, center_y), egui::pos2(left + 5.0, rect.top() + 2.0)],
+            stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(left, center_y), egui::pos2(left + 5.0, rect.bottom() - 2.0)],
+            stroke,
+        );
+    }
+
+    fn paint_plus_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.8, color);
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.center().y),
+                egui::pos2(rect.right(), rect.center().y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.center().x, rect.top()),
+                egui::pos2(rect.center().x, rect.bottom()),
+            ],
+            stroke,
+        );
+    }
+
+    fn paint_trash_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.6, color);
+
+        let body = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 2.5, rect.top() + 4.5),
+            egui::pos2(rect.right() - 2.5, rect.bottom() - 1.0),
+        );
+        painter.rect_stroke(body, egui::Rounding::same(1.5), stroke);
+
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 1.5, rect.top() + 3.5),
+                egui::pos2(rect.right() - 1.5, rect.top() + 3.5),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.center().x - 3.0, rect.top() + 1.5),
+                egui::pos2(rect.center().x + 3.0, rect.top() + 1.5),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.center().x, rect.top() + 1.5),
+                egui::pos2(rect.center().x, rect.top() + 3.0),
+            ],
+            stroke,
+        );
+
+        for x in [-3.0, 0.0, 3.0] {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.center().x + x, body.top() + 2.0),
+                    egui::pos2(rect.center().x + x, body.bottom() - 1.5),
+                ],
+                stroke,
+            );
+        }
+    }
+
+    fn paint_close_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.8, color);
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.top()),
+                egui::pos2(rect.right(), rect.bottom()),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.left(), rect.bottom()),
+                egui::pos2(rect.right(), rect.top()),
+            ],
+            stroke,
+        );
+    }
+
+    fn draw_url_editor(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            if Self::draw_button_with_icon(
+                ui,
+                "Назад",
+                egui::vec2(84.0, 28.0),
+                Self::paint_back_icon,
+            )
+            .clicked()
+            {
+                self.show_url_editor = false;
+            }
+            ui.add_space(8.0);
+            ui.heading("Редактор ссылок");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} ссылок", self.urls.len()))
+                        .color(egui::Color32::GRAY),
+                );
+            });
+        });
+
+        ui.add_space(10.0);
+
+        egui::Frame::none()
+            .fill(UiTheme::GROUP_BG)
+            .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+            .inner_margin(10.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Добавьте одну или несколько ссылок")
+                        .strong()
+                        .color(egui::Color32::GRAY),
+                );
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical()
+                    .id_salt("url_list_editor")
+                    .auto_shrink([false, true])
+                    .max_height(ui.available_height() - 70.0)
+                    .show(ui, |ui| {
+                        let mut remove_idx = None;
+
+                        for (i, url) in self.urls.iter_mut().enumerate() {
+                            egui::Frame::none()
+                                .fill(UiTheme::INPUT_BG)
+                                .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+                                .inner_margin(6.0)
+                                .rounding(4.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{:02}.", i + 1))
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                        let width = (ui.available_width() - 34.0).max(100.0);
+                                        let text_edit = ui.add(
+                                            egui::TextEdit::singleline(url)
+                                                .desired_width(width)
+                                                .frame(false)
+                                                .hint_text("https://...")
+                                                .margin(egui::vec2(0.0, 0.0)),
+                                        );
+                                        text_edit.context_menu(|ui| {
+                                            if ui.button("Вставить").clicked() {
+                                                if let Ok(mut clipboard) = Clipboard::new() {
+                                                    if let Ok(text) = clipboard.get_text() {
+                                                        *url = text;
+                                                    }
+                                                }
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("Очистить").clicked() {
+                                                url.clear();
+                                                ui.close_menu();
+                                            }
+                                        });
+
+                                        if Self::draw_icon_only_button(
+                                            ui,
+                                            egui::vec2(24.0, 24.0),
+                                            Self::paint_close_icon,
+                                        )
+                                        .clicked()
+                                        {
+                                            remove_idx = Some(i);
+                                        }
+                                    });
+                                });
+                            ui.add_space(6.0);
+                        }
+
+                        if let Some(i) = remove_idx {
+                            if self.urls.len() > 1 {
+                                self.urls.remove(i);
+                            } else {
+                                self.urls[0].clear();
+                            }
+                        }
+                    });
+            });
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if Self::draw_button_with_icon(
+                ui,
+                "Добавить строку",
+                egui::vec2(140.0, 30.0),
+                Self::paint_plus_icon,
+            )
+            .clicked()
+            {
+                self.urls.push(String::new());
+            }
+
+            if Self::draw_button_with_icon(
+                ui,
+                "Убрать пустые",
+                egui::vec2(144.0, 30.0),
+                Self::paint_trash_icon,
+            )
+            .clicked()
+            {
+                self.urls.retain(|url| !url.trim().is_empty());
+                if self.urls.is_empty() {
+                    self.urls.push(String::new());
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for YtDlpApp {
@@ -398,9 +904,12 @@ impl eframe::App for YtDlpApp {
                 }
             }
         }
-
-
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.show_url_editor {
+                self.draw_url_editor(ui);
+                return;
+            }
+
             ui.add_space(5.0);
 
             ui.horizontal(|ui| {
@@ -444,8 +953,7 @@ impl eframe::App for YtDlpApp {
                         )
                         .clicked()
                     {
-                        self.show_url_window = true;
-                        self.center_url_window_on_open = true;
+                        self.show_url_editor = true;
                     }
 
                     ui.add_space(8.0);
@@ -580,6 +1088,7 @@ impl eframe::App for YtDlpApp {
 
             ui.horizontal(|ui| {
                 if !self.is_working {
+                    let downloader_ready = self.managed_yt_dlp_path().is_file();
                     let has_missing = self
                         .component_states
                         .iter()
@@ -592,11 +1101,18 @@ impl eframe::App for YtDlpApp {
                         "СКАЧАТЬ"
                     };
 
-                    let button_enabled = !has_missing && !is_checking;
+                    let button_enabled = downloader_ready && !has_missing && !is_checking;
                     let btn = egui::Button::new(label).min_size(egui::vec2(120.0, 36.0));
 
                     if ui.add_enabled(button_enabled, btn).clicked() {
                         self.start_download(ctx);
+                    }
+
+                    if !downloader_ready && !is_checking {
+                        ui.label(
+                            egui::RichText::new("Сначала установите yt-dlp через Обновить.")
+                                .weak(),
+                        );
                     }
                 } else {
                     ui.spinner();
@@ -606,7 +1122,6 @@ impl eframe::App for YtDlpApp {
 
             ui.add_space(10.0);
 
-            // ЛОГ (Терминальный вид)
             egui::Frame::none()
                 .fill(UiTheme::INPUT_BG) // Темный фон для лога
                 .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
@@ -619,7 +1134,7 @@ impl eframe::App for YtDlpApp {
                             ui.add_sized(
                                 [ui.available_width(), ui.available_height()],
                                 egui::TextEdit::multiline(&mut self.logs)
-                                    .font(egui::TextStyle::Monospace)
+                                    .font(egui::TextStyle::Body)
                                     .desired_width(f32::INFINITY)
                                     .frame(false)
                                     .interactive(false),
@@ -627,150 +1142,6 @@ impl eframe::App for YtDlpApp {
                         });
                 });
         });
-
-        // --- ОКНО СПИСКА ССЫЛОК ---
-        if self.show_url_window {
-            let viewport_id = Self::url_manager_viewport_id();
-            let mut close_clicked = false;
-            let url_window_size = egui::vec2(720.0, 320.0);
-            let mut viewport_builder = egui::ViewportBuilder::default()
-                .with_title("Управление списком")
-                .with_inner_size([url_window_size.x, url_window_size.y])
-                .with_min_inner_size([url_window_size.x, url_window_size.y])
-                .with_resizable(false)
-                .with_maximize_button(false);
-
-            if self.center_url_window_on_open {
-                if let Some(ms) = ctx.input(|i| i.viewport().monitor_size) {
-                    let pos = egui::pos2(
-                        (ms.x - url_window_size.x) / 2.0,
-                        (ms.y - url_window_size.y) / 2.0,
-                    );
-                    viewport_builder = viewport_builder.with_position(pos);
-                }
-                self.center_url_window_on_open = false;
-            }
-
-            ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(UiTheme::BG).inner_margin(12.0)) // ВАЖНО: фон окна
-                    .show(ctx, |ui| {
-                        ui.label("Редактирование списка ссылок");
-                        ui.add_space(8.0);
-                        let bottom_h = 40.0;
-                        let list_h = ui.available_height() - bottom_h - 10.0;
-
-                        // Рамка вокруг списка
-                        egui::Frame::none()
-                            .fill(UiTheme::GROUP_BG)
-                            .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
-                            .inner_margin(8.0)
-                            .rounding(4.0)
-                            .show(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .id_salt("url_list")
-                                    .auto_shrink([false, true])
-                                    .max_height(list_h)
-                                    .show(ui, |ui| {
-                                        let mut remove_idx = None;
-                                        for (i, url) in self.urls.iter_mut().enumerate() {
-                                            // Рамка вокруг каждой строки
-                                            egui::Frame::none()
-                                                .fill(UiTheme::INPUT_BG)
-                                                .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
-                                                .inner_margin(6.0)
-                                                .rounding(4.0)
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(
-                                                            egui::RichText::new(format!(
-                                                                "{}.",
-                                                                i + 1
-                                                            ))
-                                                            .color(egui::Color32::GRAY),
-                                                        );
-                                                        let w = (ui.available_width() - 30.0)
-                                                            .max(100.0);
-                                                        let te = ui.add(
-                                                            egui::TextEdit::singleline(url)
-                                                                .desired_width(w)
-                                                                .frame(false)
-                                                                .margin(egui::vec2(0.0, 0.0)),
-                                                        );
-                                                        te.context_menu(|ui| {
-                                                            if ui.button("Paste").clicked() {
-                                                                if let Ok(mut c) = Clipboard::new()
-                                                                {
-                                                                    if let Ok(t) = c.get_text() {
-                                                                        *url = t;
-                                                                    }
-                                                                }
-                                                                ui.close_menu();
-                                                            }
-                                                            if ui.button("Clear").clicked() {
-                                                                url.clear();
-                                                                ui.close_menu();
-                                                            }
-                                                        });
-                                                        if ui
-                                                            .add(
-                                                                egui::Button::new("✖")
-                                                                    .fill(
-                                                                        egui::Color32::TRANSPARENT,
-                                                                    )
-                                                                    .frame(false),
-                                                            )
-                                                            .clicked()
-                                                        {
-                                                            remove_idx = Some(i);
-                                                        }
-                                                    });
-                                                });
-                                            ui.add_space(6.0);
-                                        }
-                                        if let Some(i) = remove_idx {
-                                            if self.urls.len() > 1 {
-                                                self.urls.remove(i);
-                                            } else {
-                                                self.urls[0].clear();
-                                            }
-                                        }
-                                    });
-                            });
-
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(egui::Button::new("➕ Add").min_size(egui::vec2(100.0, 28.0)))
-                                .clicked()
-                            {
-                                self.urls.push(String::new());
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new("Done")
-                                                .min_size(egui::vec2(100.0, 28.0)),
-                                        )
-                                        .clicked()
-                                    {
-                                        close_clicked = true;
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                                    }
-                                },
-                            );
-                        });
-                    });
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    close_clicked = true;
-                }
-            });
-            if close_clicked {
-                self.show_url_window = false;
-            }
-        }
 
         // --- ОКНО ПОДТВЕРЖДЕНИЯ ---
         if self.show_update_confirm {

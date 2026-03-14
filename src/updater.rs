@@ -5,12 +5,13 @@ use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::Read;
-use std::path::Path;
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 const YT_DLP_RELEASES_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 const FFMPEG_RELEASES_API: &str = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComponentKind {
@@ -34,8 +35,15 @@ pub struct ComponentInfo {
     pub local_version: Option<String>,
     pub latest_version: Option<String>,
     pub status: ComponentStatus,
+    pub asset_name: Option<String>,
     pub download_url: Option<String>,
     pub checksum_url: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpdateReport {
+    pub components: Vec<ComponentInfo>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,25 +57,50 @@ struct ReleaseInfo {
     assets: Vec<(String, String)>,
 }
 
-pub fn check_for_updates(app_dir: &Path, app_version: &str) -> Result<Vec<ComponentInfo>, String> {
+pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
     let mut components = Vec::new();
-
-    let _ = app_version;
+    let mut warnings = Vec::new();
+    let client = match http_client() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warnings.push(format!(">>> Не удалось создать HTTP-клиент для проверки обновлений: {err}"));
+            None
+        }
+    };
 
     let yt_local = read_version_from_binary(&app_dir.join("yt-dlp.exe"), &["--version"]);
-    let yt_release = fetch_release(YT_DLP_RELEASES_API).ok();
+    let yt_release = client.as_ref().and_then(|client| match fetch_release(client, YT_DLP_RELEASES_API) {
+        Ok(release) => Some(release),
+        Err(err) => {
+            warnings.push(format!(">>> Не удалось получить релиз yt-dlp: {err}"));
+            None
+        }
+    });
     let yt_asset = yt_release
         .as_ref()
-        .and_then(|release| release.assets.iter().find(|(name, _)| name.eq_ignore_ascii_case("yt-dlp.exe")).cloned());
+        .and_then(|release| {
+            release
+                .assets
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("yt-dlp.exe"))
+                .cloned()
+        });
     let yt_checksum = yt_release
         .as_ref()
-        .and_then(|release| release.assets.iter().find(|(name, _)| name.contains("SHA2-256SUMS")).map(|(_, url)| url.clone()));
+        .and_then(|release| {
+            release
+                .assets
+                .iter()
+                .find(|(name, _)| name.contains("SHA2-256SUMS"))
+                .map(|(_, url)| url.clone())
+        });
 
     components.push(build_component(
         ComponentKind::YtDlp,
         "yt-dlp",
         yt_local,
         yt_release.as_ref().map(|r| r.tag.clone()),
+        yt_asset.clone().map(|(name, _)| name),
         yt_asset.map(|(_, url)| url),
         yt_checksum,
     ));
@@ -77,14 +110,23 @@ pub fn check_for_updates(app_dir: &Path, app_version: &str) -> Result<Vec<Compon
     let ffmpeg_local = read_version_from_binary(&ffmpeg_path, &["-version"]);
     let ffprobe_local = read_version_from_binary(&ffprobe_path, &["-version"]);
 
-    let ff_release = fetch_release(FFMPEG_RELEASES_API).ok();
+    let ff_release = client.as_ref().and_then(|client| match fetch_release(client, FFMPEG_RELEASES_API) {
+        Ok(release) => Some(release),
+        Err(err) => {
+            warnings.push(format!(">>> Не удалось получить релиз ffmpeg: {err}"));
+            None
+        }
+    });
     let ff_asset = ff_release.as_ref().and_then(|release| {
         release
             .assets
             .iter()
             .find(|(name, _)| {
                 let lower = name.to_lowercase();
-                lower.contains("ffmpeg-release-essentials") && lower.ends_with(".zip")
+                lower.contains("ffmpeg-release-essentials")
+                    && Path::new(&lower)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
             })
             .cloned()
     });
@@ -104,6 +146,7 @@ pub fn check_for_updates(app_dir: &Path, app_version: &str) -> Result<Vec<Compon
         "ffmpeg",
         ffmpeg_local,
         ff_release.as_ref().map(|r| r.tag.clone()),
+        ff_asset.clone().map(|(name, _)| name),
         ff_asset.clone().map(|(_, url)| url),
         ff_checksum.clone(),
     ));
@@ -113,40 +156,48 @@ pub fn check_for_updates(app_dir: &Path, app_version: &str) -> Result<Vec<Compon
         "ffprobe",
         ffprobe_local,
         ff_release.as_ref().map(|r| r.tag.clone()),
+        ff_asset.clone().map(|(name, _)| name),
         ff_asset.map(|(_, url)| url),
         ff_checksum,
     ));
 
-    Ok(components)
+    UpdateReport {
+        components,
+        warnings,
+    }
 }
 
 pub fn install_component(app_dir: &Path, component: &ComponentInfo) -> Result<InstallResult, String> {
+    let client = http_client()?;
     let download_url = component
         .download_url
         .as_ref()
         .ok_or_else(|| format!("{}: ссылка на загрузку не найдена", component.title))?;
+    let asset_name = component.asset_name.as_deref();
 
     match component.kind {
         ComponentKind::YtDlp => {
             let target = app_dir.join("yt-dlp.exe");
             let staged = app_dir.join("yt-dlp.exe.tmp");
-            download_to_path(download_url, &staged)?;
-            verify_checksum_if_present(&staged, component.checksum_url.as_deref(), Some("yt-dlp.exe"))?;
+            download_to_path(&client, download_url, &staged)?;
+            verify_checksum_if_present(
+                &client,
+                &staged,
+                component.checksum_url.as_deref(),
+                asset_name.or(Some("yt-dlp.exe")),
+            )?;
             atomic_replace(&staged, &target)?;
             Ok(InstallResult::Installed("yt-dlp обновлён".to_string()))
         }
-        ComponentKind::Ffmpeg => {
+        ComponentKind::Ffmpeg | ComponentKind::Ffprobe => {
             let zip_path = app_dir.join("ffmpeg-release-essentials.zip.tmp");
-            download_to_path(download_url, &zip_path)?;
-            verify_checksum_if_present(&zip_path, component.checksum_url.as_deref(), Some(".zip"))?;
-            install_ffmpeg_from_zip(&zip_path, app_dir)?;
-            let _ = fs::remove_file(&zip_path);
-            Ok(InstallResult::Installed("ffmpeg/ffprobe обновлены".to_string()))
-        }
-        ComponentKind::Ffprobe => {
-            let zip_path = app_dir.join("ffmpeg-release-essentials.zip.tmp");
-            download_to_path(download_url, &zip_path)?;
-            verify_checksum_if_present(&zip_path, component.checksum_url.as_deref(), Some(".zip"))?;
+            download_to_path(&client, download_url, &zip_path)?;
+            verify_checksum_if_present(
+                &client,
+                &zip_path,
+                component.checksum_url.as_deref(),
+                asset_name,
+            )?;
             install_ffmpeg_from_zip(&zip_path, app_dir)?;
             let _ = fs::remove_file(&zip_path);
             Ok(InstallResult::Installed("ffmpeg/ffprobe обновлены".to_string()))
@@ -159,17 +210,16 @@ fn build_component(
     title: &str,
     local_version: Option<String>,
     latest_version: Option<String>,
+    asset_name: Option<String>,
     download_url: Option<String>,
     checksum_url: Option<String>,
 ) -> ComponentInfo {
     let status = match (&local_version, &latest_version) {
         (None, Some(_)) => ComponentStatus::Missing,
-        (None, None) => ComponentStatus::Unknown,
-        (Some(_), None) => ComponentStatus::Unknown,
+        (None | Some(_), None) => ComponentStatus::Unknown,
         (Some(local), Some(latest)) => match compare_versions(local, latest) {
             Some(Ordering::Less) => ComponentStatus::UpdateAvailable,
-            Some(Ordering::Equal) => ComponentStatus::UpToDate,
-            Some(Ordering::Greater) => ComponentStatus::UpToDate,
+            Some(Ordering::Equal | Ordering::Greater) => ComponentStatus::UpToDate,
             None => {
                 if normalize_version(local) == normalize_version(latest) {
                     ComponentStatus::UpToDate
@@ -186,6 +236,7 @@ fn build_component(
         local_version,
         latest_version,
         status,
+        asset_name,
         download_url,
         checksum_url,
     }
@@ -198,8 +249,7 @@ fn http_client() -> Result<Client, String> {
         .map_err(|e| e.to_string())
 }
 
-fn fetch_release(api_url: &str) -> Result<ReleaseInfo, String> {
-    let client = http_client()?;
+fn fetch_release(client: &Client, api_url: &str) -> Result<ReleaseInfo, String> {
     let response = client.get(api_url).send().map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
@@ -209,7 +259,7 @@ fn fetch_release(api_url: &str) -> Result<ReleaseInfo, String> {
     let tag = value
         .get("tag_name")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| "tag_name не найден".to_string())?;
 
     let assets = value
@@ -232,7 +282,6 @@ fn read_version_from_binary(binary_path: &Path, args: &[&str]) -> Option<String>
         return None;
     }
 
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
     let output = Command::new(binary_path)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
@@ -292,8 +341,7 @@ fn compare_versions(local: &str, latest: &str) -> Option<Ordering> {
     }
 }
 
-fn download_to_path(url: &str, out_path: &Path) -> Result<(), String> {
-    let client = http_client()?;
+fn download_to_path(client: &Client, url: &str, out_path: &Path) -> Result<(), String> {
     let mut response = client.get(url).send().map_err(|e| e.to_string())?;
     if !response.status().is_success() {
         return Err(format!("Ошибка загрузки {}: HTTP {}", url, response.status()));
@@ -304,18 +352,25 @@ fn download_to_path(url: &str, out_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn verify_checksum_if_present(file_path: &Path, checksum_url: Option<&str>, filter_name: Option<&str>) -> Result<(), String> {
+fn verify_checksum_if_present(
+    client: &Client,
+    file_path: &Path,
+    checksum_url: Option<&str>,
+    expected_asset_name: Option<&str>,
+) -> Result<(), String> {
     let Some(url) = checksum_url else { return Ok(()); };
-    let client = http_client()?;
     let body = client
         .get(url)
         .send()
-        .and_then(|resp| resp.error_for_status())
+        .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(|e| e.to_string())?
         .text()
         .map_err(|e| e.to_string())?;
 
-    let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_lowercase();
+    let fallback_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
     let expected = body
         .lines()
         .find_map(|line| {
@@ -328,15 +383,17 @@ fn verify_checksum_if_present(file_path: &Path, checksum_url: Option<&str>, filt
                 return None;
             }
 
-            if let Some(f) = filter_name {
-                let lf = f.to_lowercase();
-                if lf.starts_with('.') {
-                    if !l.to_lowercase().contains(&lf) {
-                        return None;
-                    }
-                } else if !l.to_lowercase().contains(&lf) && !l.to_lowercase().contains(&file_name) {
-                    return None;
-                }
+            let name_part = l[64..]
+                .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '*')
+                .trim();
+            let normalized_name = name_part.rsplit(['/', '\\']).next().unwrap_or(name_part);
+            let expected_name = expected_asset_name.unwrap_or(fallback_name);
+
+            if !normalized_name.eq_ignore_ascii_case(expected_name)
+                && (expected_asset_name.is_some()
+                    || !l.to_lowercase().contains(&fallback_name.to_lowercase()))
+            {
+                return None;
             }
             Some(hash.to_lowercase())
         })
@@ -365,7 +422,7 @@ fn verify_checksum_if_present(file_path: &Path, checksum_url: Option<&str>, filt
     let actual = format!("{:x}", hasher.finalize());
 
     if actual != expected {
-        return Err(format!("Checksum mismatch: expected {}, got {}", expected, actual));
+        return Err(format!("Checksum mismatch: expected {expected}, got {actual}"));
     }
 
     Ok(())
@@ -380,7 +437,7 @@ fn atomic_replace(staged_path: &Path, target_path: &Path) -> Result<(), String> 
     }
 
     match fs::rename(staged_path, target_path) {
-        Ok(_) => {
+        Ok(()) => {
             let _ = fs::remove_file(&backup_path);
             Ok(())
         }
