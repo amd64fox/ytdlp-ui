@@ -10,16 +10,23 @@ use std::io::{BufRead, BufReader, ErrorKind, Read};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{
+    mpsc::{channel, Receiver, Sender},
+    Arc, Mutex,
+};
 use std::thread;
+use std::time::Duration;
 
 use arboard::Clipboard;
 use serde::{Deserialize, Serialize};
 
-// --- КОНФИГУРАЦИЯ ---
 const CONFIG_FILE: &str = "config.toml";
 const APP_CONFIG_DIR: &str = "ytdlp-ui";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const COMPACT_WINDOW_SIZE: [f32; 2] = [500.0, 524.0];
+const LOG_WINDOW_SIZE: [f32; 2] = [500.0, 724.0];
+const LOG_AREA_HEIGHT: f32 = 160.0;
+const COMPONENT_LIST_HEIGHT: f32 = 62.0;
 const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\consola.ttf",
     r"C:\Windows\Fonts\CascadiaMono.ttf",
@@ -170,36 +177,77 @@ impl AppConfig {
 
 enum AppMessage {
     Log(String),
+    Status(StatusMessage),
     UpdateSnapshot(Vec<updater::ComponentInfo>),
     UpdatingComponent(Option<String>),
-    AllFinished,
+    AllFinished(FinishState),
 }
 
-// --- UI Theme (СТИЛЬ LOADERSPOT) ---
+#[derive(Clone)]
+struct StatusMessage {
+    tone: StatusTone,
+    title: String,
+    detail: String,
+    progress: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+enum StatusTone {
+    Idle,
+    Running,
+    Success,
+    Warning,
+    Error,
+}
+
+struct FinishState {
+    had_error: bool,
+    title: String,
+    detail: String,
+}
+
+impl StatusMessage {
+    fn idle() -> Self {
+        Self::new(
+            StatusTone::Idle,
+            "Готов к загрузке",
+            "Добавьте ссылку и нажмите Скачать",
+            None,
+        )
+    }
+
+    fn new(
+        tone: StatusTone,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        progress: Option<(usize, usize)>,
+    ) -> Self {
+        Self {
+            tone,
+            title: title.into(),
+            detail: detail.into(),
+            progress,
+        }
+    }
+}
+
 pub struct UiTheme;
 impl UiTheme {
-    // Очень темный фон (почти черный)
     pub const BG: egui::Color32 = egui::Color32::from_rgb(18, 18, 18);
 
-    // Группы: Прозрачные или чуть светлее фона, НО ГЛАВНОЕ - РАМКА
     pub const GROUP_BG: egui::Color32 = egui::Color32::from_rgb(24, 24, 24);
 
-    // Поля ввода: Темнее группы ("вдавленные")
     pub const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(10, 10, 10);
 
-    // Обводка: Заметный серый контур (суть стиля Wireframe)
     pub const STROKE: egui::Color32 = egui::Color32::from_rgb(65, 65, 65);
 
-    // Кнопки
     pub const BUTTON_BG: egui::Color32 = egui::Color32::from_rgb(45, 45, 45);
     pub const BUTTON_HOVER: egui::Color32 = egui::Color32::from_rgb(70, 70, 70);
 }
 
-// Настройка глобального стиля виджетов
 fn configure_global_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
-    // Скругления как на скриншоте (небольшие)
     let rounding = egui::Rounding::same(4.0);
     style.visuals.window_rounding = rounding;
     style.visuals.widgets.noninteractive.rounding = rounding;
@@ -207,10 +255,8 @@ fn configure_global_style(ctx: &egui::Context) {
     style.visuals.widgets.hovered.rounding = rounding;
     style.visuals.widgets.active.rounding = rounding;
 
-    // СТИЛЬ КНОПОК
     style.visuals.widgets.inactive.bg_fill = UiTheme::BUTTON_BG;
     style.visuals.widgets.inactive.weak_bg_fill = UiTheme::BUTTON_BG;
-    // Тонкая рамка вокруг кнопок
     style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, UiTheme::STROKE);
     style.visuals.widgets.inactive.fg_stroke =
         egui::Stroke::new(1.0, egui::Color32::from_gray(220));
@@ -220,7 +266,6 @@ fn configure_global_style(ctx: &egui::Context) {
 
     style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(90, 90, 90);
 
-    // Цвета окна
     style.visuals.panel_fill = UiTheme::BG;
     style.visuals.window_fill = UiTheme::BG;
     style.visuals.window_stroke = egui::Stroke::new(1.0, UiTheme::STROKE);
@@ -232,8 +277,10 @@ struct YtDlpApp {
     urls: Vec<String>,
     config: AppConfig,
     logs: String,
+    status: StatusMessage,
 
     is_working: bool,
+    show_logs: bool,
     show_url_editor: bool,
     show_update_confirm: bool,
     center_confirm_window_on_open: bool,
@@ -256,6 +303,33 @@ impl YtDlpApp {
         ctx.request_repaint();
     }
 
+    fn send_status(sender: &Sender<AppMessage>, ctx: &egui::Context, status: StatusMessage) {
+        let _ = sender.send(AppMessage::Status(status));
+        ctx.request_repaint();
+    }
+
+    fn set_local_error(&mut self, title: impl Into<String>, detail: impl Into<String>) {
+        let title = title.into();
+        let detail = detail.into();
+        self.logs.push_str(&format!(">>> {title}: {detail}\n"));
+        self.status = StatusMessage::new(StatusTone::Error, title, detail, None);
+    }
+
+    fn extract_yt_dlp_error_line(line: &str) -> Option<String> {
+        let clean = line
+            .trim()
+            .strip_prefix("stderr | ")
+            .unwrap_or_else(|| line.trim())
+            .trim();
+        let (_, message) = clean.split_once("ERROR:")?;
+        let message = message.trim();
+        if message.is_empty() {
+            None
+        } else {
+            Some(message.to_string())
+        }
+    }
+
     fn decode_process_line(bytes: &[u8]) -> String {
         match std::str::from_utf8(bytes) {
             Ok(text) => text.to_owned(),
@@ -271,6 +345,7 @@ impl YtDlpApp {
         sender: Sender<AppMessage>,
         ctx: egui::Context,
         prefix: &'static str,
+        error_sink: Option<Arc<Mutex<Option<String>>>>,
     ) -> thread::JoinHandle<()>
     where
         R: Read + Send + 'static,
@@ -295,6 +370,13 @@ impl YtDlpApp {
                         } else {
                             format!("{prefix}{line}")
                         };
+                        if let Some(error) = Self::extract_yt_dlp_error_line(&rendered) {
+                            if let Some(error_sink) = &error_sink {
+                                if let Ok(mut latest_error) = error_sink.lock() {
+                                    *latest_error = Some(error);
+                                }
+                            }
+                        }
                         Self::send_log(&sender, &ctx, rendered);
                     }
                     Err(err) => {
@@ -318,7 +400,18 @@ impl YtDlpApp {
         thread::spawn(move || {
             let report = updater::check_for_updates(&app_dir);
             for warning in report.warnings {
+                let detail = warning.trim_start_matches(">>>").trim().to_string();
                 Self::send_log(&sender, &ctx, warning);
+                Self::send_status(
+                    &sender,
+                    &ctx,
+                    StatusMessage::new(
+                        StatusTone::Warning,
+                        "Проверка обновлений не завершена",
+                        detail,
+                        None,
+                    ),
+                );
             }
             let _ = sender.send(AppMessage::UpdateSnapshot(report.components));
             ctx.request_repaint();
@@ -332,11 +425,18 @@ impl YtDlpApp {
         let (config, config_messages) = AppConfig::load(&config_path, &app_dir);
         let ctx = cc.egui_ctx.clone();
         let mut logs = String::new();
+        let mut status = StatusMessage::idle();
 
         configure_fonts(&ctx);
         configure_global_style(&ctx);
 
         for message in config_messages {
+            status = StatusMessage::new(
+                StatusTone::Warning,
+                "Проверьте конфигурацию",
+                message.trim_start_matches(">>>").trim(),
+                None,
+            );
             logs.push_str(&message);
             logs.push('\n');
         }
@@ -347,7 +447,9 @@ impl YtDlpApp {
             urls: vec![String::new()],
             config,
             logs,
+            status,
             is_working: false,
+            show_logs: false,
             show_url_editor: false,
             show_update_confirm: false,
             center_confirm_window_on_open: false,
@@ -360,7 +462,6 @@ impl YtDlpApp {
         }
     }
 
-    // ... (методы collect_update_targets, start_download, start_update без изменений логики) ...
     fn collect_update_targets(&self) -> Vec<updater::ComponentInfo> {
         let mut result: Vec<updater::ComponentInfo> = self
             .component_states
@@ -417,25 +518,26 @@ impl YtDlpApp {
 
     fn start_download(&mut self, ctx: &egui::Context) {
         if let Err(err) = fs::create_dir_all(&self.config.output_path) {
-            self.logs.push_str(&format!(
-                ">>> Не удалось создать папку загрузок {}: {err}\n",
-                self.config.output_path
-            ));
+            self.set_local_error(
+                "Не удалось создать папку загрузок",
+                format!("{}: {err}", self.config.output_path),
+            );
             return;
         }
 
         if let Err(err) = self.config.save(&self.config_path) {
-            self.logs.push_str(&format!(
-                ">>> Не удалось сохранить конфиг {}: {err}\n",
-                self.config_path.display()
-            ));
+            self.set_local_error(
+                "Не удалось сохранить конфиг",
+                format!("{}: {err}", self.config_path.display()),
+            );
             return;
         }
 
         let yt_dlp_path = self.managed_yt_dlp_path();
         if !yt_dlp_path.is_file() {
-            self.logs.push_str(
-                ">>> yt-dlp.exe не найден. Сначала установите его через кнопку обновления.\n",
+            self.set_local_error(
+                "yt-dlp.exe не найден",
+                "Сначала установите его через Обновить",
             );
             return;
         }
@@ -447,7 +549,7 @@ impl YtDlpApp {
             .filter(|s| !s.is_empty())
             .collect();
         if valid_urls.is_empty() {
-            self.logs.push_str(">>> Список ссылок пуст!\n");
+            self.set_local_error("Список ссылок пуст", "Добавьте хотя бы одну ссылку");
             return;
         }
         self.is_working = true;
@@ -455,6 +557,12 @@ impl YtDlpApp {
         let total = valid_urls.len();
         self.logs
             .push_str(&format!(">>> Старт: {} файл(ов)\n", total));
+        self.status = StatusMessage::new(
+            StatusTone::Running,
+            "Подготовка загрузки",
+            format!("В очереди: {} файл(ов)", total),
+            Some((0, total)),
+        );
         let path = self.config.output_path.clone();
         let yt_dlp_path = yt_dlp_path.clone();
         let config_args = self.config.yt_dlp_args.clone();
@@ -462,7 +570,19 @@ impl YtDlpApp {
         let thread_ctx = ctx.clone();
         thread::spawn(move || {
             let clean_path = path.trim_end_matches('\\');
+            let mut had_error = false;
+            let mut last_error = None;
             for (i, url) in valid_urls.iter().enumerate() {
+                Self::send_status(
+                    &sender,
+                    &thread_ctx,
+                    StatusMessage::new(
+                        StatusTone::Running,
+                        format!("Скачивание {} из {}", i + 1, total),
+                        url.clone(),
+                        Some((i + 1, total)),
+                    ),
+                );
                 Self::send_log(
                     &sender,
                     &thread_ctx,
@@ -488,8 +608,15 @@ impl YtDlpApp {
                     .spawn();
                 match child {
                     Ok(mut child_process) => {
+                        let last_stderr_error = Arc::new(Mutex::new(None));
                         let stdout_handle = child_process.stdout.take().map(|stdout| {
-                            Self::spawn_pipe_reader(stdout, sender.clone(), thread_ctx.clone(), "")
+                            Self::spawn_pipe_reader(
+                                stdout,
+                                sender.clone(),
+                                thread_ctx.clone(),
+                                "",
+                                None,
+                            )
                         });
                         let stderr_handle = child_process.stderr.take().map(|stderr| {
                             Self::spawn_pipe_reader(
@@ -497,6 +624,7 @@ impl YtDlpApp {
                                 sender.clone(),
                                 thread_ctx.clone(),
                                 "stderr | ",
+                                Some(last_stderr_error.clone()),
                             )
                         });
 
@@ -514,32 +642,94 @@ impl YtDlpApp {
                                         || "без кода".to_string(),
                                         |code| code.to_string(),
                                     );
+                                    let detail = last_stderr_error
+                                        .lock()
+                                        .ok()
+                                        .and_then(|error| error.clone())
+                                        .unwrap_or_else(|| {
+                                            format!("yt-dlp завершился с кодом {exit_code}")
+                                        });
+                                    had_error = true;
+                                    last_error = Some(detail.clone());
                                     Self::send_log(
                                         &sender,
                                         &thread_ctx,
                                         format!("❌ yt-dlp завершился с кодом {exit_code}"),
                                     );
+                                    Self::send_status(
+                                        &sender,
+                                        &thread_ctx,
+                                        StatusMessage::new(
+                                            StatusTone::Error,
+                                            "Ошибка загрузки",
+                                            detail,
+                                            Some((i + 1, total)),
+                                        ),
+                                    );
+                                } else {
+                                    Self::send_status(
+                                        &sender,
+                                        &thread_ctx,
+                                        StatusMessage::new(
+                                            StatusTone::Success,
+                                            "Ссылка загружена",
+                                            url.clone(),
+                                            Some((i + 1, total)),
+                                        ),
+                                    );
                                 }
                             }
                             Err(err) => {
-                                Self::send_log(
+                                let detail =
+                                    format!("Не удалось дождаться завершения yt-dlp: {err}");
+                                had_error = true;
+                                last_error = Some(detail.clone());
+                                Self::send_log(&sender, &thread_ctx, format!("❌ {detail}"));
+                                Self::send_status(
                                     &sender,
                                     &thread_ctx,
-                                    format!("❌ Не удалось дождаться завершения yt-dlp: {err}"),
+                                    StatusMessage::new(
+                                        StatusTone::Error,
+                                        "Ошибка загрузки",
+                                        detail,
+                                        Some((i + 1, total)),
+                                    ),
                                 );
                             }
                         }
                     }
                     Err(e) => {
-                        Self::send_log(
+                        let detail = format!("Ошибка запуска yt-dlp: {e}");
+                        had_error = true;
+                        last_error = Some(detail.clone());
+                        Self::send_log(&sender, &thread_ctx, format!("❌ {detail}"));
+                        Self::send_status(
                             &sender,
                             &thread_ctx,
-                            format!("❌ Ошибка запуска yt-dlp: {e}"),
+                            StatusMessage::new(
+                                StatusTone::Error,
+                                "Ошибка загрузки",
+                                detail,
+                                Some((i + 1, total)),
+                            ),
                         );
                     }
                 }
             }
-            let _ = sender.send(AppMessage::AllFinished);
+            let finish = if had_error {
+                FinishState {
+                    had_error: true,
+                    title: "Загрузка завершена с ошибкой".to_string(),
+                    detail: last_error.unwrap_or_else(|| "Проверьте полный лог".to_string()),
+                }
+            } else {
+                FinishState {
+                    had_error: false,
+                    title: "Загрузка завершена".to_string(),
+                    detail: format!("Скачано: {} файл(ов)", total),
+                }
+            };
+            let _ = sender.send(AppMessage::AllFinished(finish));
             thread_ctx.request_repaint();
         });
     }
@@ -548,22 +738,69 @@ impl YtDlpApp {
         let to_update = self.collect_update_targets();
         if to_update.is_empty() {
             self.logs.push_str(">>> Обновления не требуются.\n");
+            self.status = StatusMessage::new(
+                StatusTone::Success,
+                "Обновления не требуются",
+                "Все компоненты уже актуальны",
+                None,
+            );
             return;
         }
         self.is_working = true;
+        let total = to_update.len();
+        self.status = StatusMessage::new(
+            StatusTone::Running,
+            "Обновление компонентов",
+            format!("В очереди: {total}"),
+            Some((0, total)),
+        );
         let sender = self.sender.clone();
         let thread_ctx = ctx.clone();
         let app_dir = self.app_dir.clone();
         thread::spawn(move || {
-            for component in &to_update {
+            let mut had_error = false;
+            let mut last_error = None;
+            for (index, component) in to_update.iter().enumerate() {
                 let _ = sender.send(AppMessage::UpdatingComponent(Some(component.title.clone())));
+                Self::send_status(
+                    &sender,
+                    &thread_ctx,
+                    StatusMessage::new(
+                        StatusTone::Running,
+                        format!("Обновление {}", component.title),
+                        "Загрузка и установка",
+                        Some((index + 1, total)),
+                    ),
+                );
                 match updater::install_component(&app_dir, component) {
                     Ok(updater::InstallResult::Installed(msg)) => {
                         let _ = sender.send(AppMessage::Log(format!("✅ {msg}")));
+                        Self::send_status(
+                            &sender,
+                            &thread_ctx,
+                            StatusMessage::new(
+                                StatusTone::Success,
+                                "Компонент обновлен",
+                                msg,
+                                Some((index + 1, total)),
+                            ),
+                        );
                     }
                     Err(err) => {
-                        let _ = sender
-                            .send(AppMessage::Log(format!("❌ {}: {}", component.title, err)));
+                        let detail = format!("{}: {}", component.title, err);
+                        had_error = true;
+                        last_error = Some(detail.clone());
+                        let _ = sender.send(AppMessage::Log(format!("❌ {detail}")));
+                        Self::send_status(
+                            &sender,
+                            &thread_ctx,
+                            StatusMessage::new(
+                                StatusTone::Error,
+                                "Ошибка обновления",
+                                detail,
+                                Some((index + 1, total)),
+                            ),
+                        );
                     }
                 }
                 thread_ctx.request_repaint();
@@ -575,7 +812,20 @@ impl YtDlpApp {
                 Self::send_log(&sender, &thread_ctx, warning);
             }
             let _ = sender.send(AppMessage::UpdateSnapshot(report.components));
-            let _ = sender.send(AppMessage::AllFinished);
+            let finish = if had_error {
+                FinishState {
+                    had_error: true,
+                    title: "Обновление завершено с ошибкой".to_string(),
+                    detail: last_error.unwrap_or_else(|| "Проверьте полный лог".to_string()),
+                }
+            } else {
+                FinishState {
+                    had_error: false,
+                    title: "Обновление завершено".to_string(),
+                    detail: "Компоненты готовы к работе".to_string(),
+                }
+            };
+            let _ = sender.send(AppMessage::AllFinished(finish));
             thread_ctx.request_repaint();
         });
     }
@@ -599,14 +849,127 @@ impl YtDlpApp {
             updater::ComponentStatus::UpToDate => (
                 egui::Color32::from_rgb(100, 200, 100),
                 "актуален".to_string(),
-            ), // Менее яркий зеленый
+            ),
             updater::ComponentStatus::Unknown => (visuals.weak_text_color(), "unknown".to_string()),
         }
     }
 
     fn draw_status_dot(ui: &mut egui::Ui, color: egui::Color32) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-        ui.painter().circle_filled(rect.center(), 3.0, color); // Чуть меньше точка
+        ui.painter().circle_filled(rect.center(), 3.0, color);
+    }
+
+    fn draw_component_skeleton_row(ui: &mut egui::Ui, row: usize) {
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
+        let painter = ui.painter();
+        let time = ui.input(|input| input.time);
+        let y = rect.center().y;
+        let title_width = [62.0, 74.0, 70.0][row.min(2)];
+        let title_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 18.0, y - 4.0),
+            egui::vec2(title_width, 8.0),
+        );
+        let version_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 96.0, y - 3.0),
+            egui::vec2(38.0, 6.0),
+        );
+
+        painter.circle_filled(
+            egui::pos2(rect.left() + 5.0, y),
+            3.0,
+            egui::Color32::from_rgb(42, 42, 42),
+        );
+
+        Self::paint_skeleton_bar(painter, title_rect, time, row as f64 * 0.12);
+        Self::paint_skeleton_bar(painter, version_rect, time, row as f64 * 0.12 + 0.08);
+    }
+
+    fn paint_skeleton_bar(painter: &egui::Painter, rect: egui::Rect, time: f64, phase_offset: f64) {
+        let rounding = egui::Rounding::same(2.0);
+        let base = egui::Color32::from_rgb(36, 36, 36);
+        let highlight = egui::Color32::from_rgb(76, 76, 76);
+        let shimmer_width = rect.width() * 0.42;
+        let cycle = (time * 1.35 + phase_offset).rem_euclid(1.0) as f32;
+        let shimmer_x = rect.left() - shimmer_width + cycle * (rect.width() + shimmer_width * 2.0);
+
+        painter.rect_filled(rect, rounding, base);
+
+        let shimmer_rect = egui::Rect::from_min_size(
+            egui::pos2(shimmer_x, rect.top()),
+            egui::vec2(shimmer_width, rect.height()),
+        );
+        painter
+            .with_clip_rect(rect)
+            .rect_filled(shimmer_rect, rounding, highlight);
+    }
+
+    fn status_color(ui: &egui::Ui, tone: StatusTone) -> egui::Color32 {
+        match tone {
+            StatusTone::Idle => ui.visuals().weak_text_color(),
+            StatusTone::Running => egui::Color32::from_rgb(245, 184, 82),
+            StatusTone::Success => egui::Color32::from_rgb(100, 200, 100),
+            StatusTone::Warning => ui.visuals().warn_fg_color,
+            StatusTone::Error => ui.visuals().error_fg_color,
+        }
+    }
+
+    fn apply_log_window_size(ctx: &egui::Context, show_logs: bool) {
+        let [width, height] = if show_logs {
+            LOG_WINDOW_SIZE
+        } else {
+            COMPACT_WINDOW_SIZE
+        };
+        let size = egui::vec2(width, height);
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(size));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+    }
+
+    fn draw_status_panel(&self, ui: &mut egui::Ui) {
+        let color = Self::status_color(ui, self.status.tone);
+
+        egui::Frame::none()
+            .fill(UiTheme::GROUP_BG)
+            .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+            .inner_margin(10.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if matches!(self.status.tone, StatusTone::Running) {
+                        ui.spinner();
+                    } else {
+                        Self::draw_status_dot(ui, color);
+                    }
+                    ui.label(
+                        egui::RichText::new(&self.status.title)
+                            .strong()
+                            .color(egui::Color32::from_gray(230)),
+                    );
+                    if let Some((current, total)) = self.status.progress {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{current} из {total}"))
+                                    .small()
+                                    .color(color),
+                            );
+                        });
+                    }
+                });
+
+                if !self.status.detail.is_empty() {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.status.detail)
+                                .small()
+                                .color(egui::Color32::from_gray(155)),
+                        )
+                        .truncate(),
+                    );
+                }
+            });
     }
 
     fn draw_button_with_icon(
@@ -615,12 +978,23 @@ impl YtDlpApp {
         min_size: egui::Vec2,
         icon: impl FnOnce(&egui::Painter, egui::Rect, egui::Color32),
     ) -> egui::Response {
-        let (rect, response) = ui.allocate_exact_size(min_size, egui::Sense::click());
+        let is_enabled = ui.is_enabled();
+        let sense = if is_enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, response) = ui.allocate_exact_size(min_size, sense);
 
         if ui.is_rect_visible(rect) {
             let visuals = ui.style().interact(&response);
             let painter = ui.painter();
             let rounding = egui::Rounding::same(4.0);
+            let fg_color = if is_enabled {
+                visuals.fg_stroke.color
+            } else {
+                ui.visuals().weak_text_color()
+            };
 
             painter.rect_filled(rect, rounding, visuals.bg_fill);
             painter.rect_stroke(rect, rounding, visuals.bg_stroke);
@@ -629,14 +1003,14 @@ impl YtDlpApp {
                 egui::pos2(rect.left() + 16.0, rect.center().y),
                 egui::vec2(14.0, 14.0),
             );
-            icon(painter, icon_rect, visuals.fg_stroke.color);
+            icon(painter, icon_rect, fg_color);
 
             painter.text(
                 egui::pos2(icon_rect.right() + 8.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 text,
                 egui::TextStyle::Button.resolve(ui.style()),
-                visuals.fg_stroke.color,
+                fg_color,
             );
         }
 
@@ -707,6 +1081,43 @@ impl YtDlpApp {
             ],
             stroke,
         );
+    }
+
+    fn paint_refresh_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.6, color);
+        let center = rect.center();
+        let radius = rect.width().min(rect.height()) * 0.42;
+
+        painter.circle_stroke(center, radius, stroke);
+        painter.line_segment(
+            [
+                egui::pos2(rect.right() - 1.5, center.y - radius * 0.15),
+                egui::pos2(rect.right() - 1.5, rect.top() + 1.0),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(rect.right() - 1.5, rect.top() + 1.0),
+                egui::pos2(rect.right() - 6.0, rect.top() + 1.8),
+            ],
+            stroke,
+        );
+    }
+
+    fn paint_log_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.4, color);
+        painter.rect_stroke(rect, egui::Rounding::same(2.0), stroke);
+
+        for offset in [4.0, 8.0, 12.0] {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 3.5, rect.top() + offset),
+                    egui::pos2(rect.right() - 3.5, rect.top() + offset),
+                ],
+                stroke,
+            );
+        }
     }
 
     fn paint_trash_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
@@ -911,17 +1322,37 @@ impl eframe::App for YtDlpApp {
                     self.logs.push_str(&line);
                     self.logs.push('\n');
                 }
+                AppMessage::Status(status) => {
+                    self.status = status;
+                }
                 AppMessage::UpdateSnapshot(states) => {
                     self.component_states = states;
                 }
                 AppMessage::UpdatingComponent(current) => {
                     self.updating_component = current;
                 }
-                AppMessage::AllFinished => {
+                AppMessage::AllFinished(finish) => {
                     self.is_working = false;
+                    self.status = StatusMessage::new(
+                        if finish.had_error {
+                            StatusTone::Error
+                        } else {
+                            StatusTone::Success
+                        },
+                        finish.title,
+                        finish.detail,
+                        None,
+                    );
                     self.logs.push_str(">>> Готово.\n");
                 }
             }
+        }
+        if self.show_logs && self.logs.is_empty() {
+            self.show_logs = false;
+            Self::apply_log_window_size(ctx, false);
+        }
+        if self.component_states.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(80));
         }
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.show_url_editor {
@@ -935,9 +1366,22 @@ impl eframe::App for YtDlpApp {
                 ui.heading("YouTube Downloader");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.is_working {
-                        if ui.button("🔄 Обновить").clicked() {
+                        if Self::draw_button_with_icon(
+                            ui,
+                            "Обновить",
+                            egui::vec2(96.0, 30.0),
+                            Self::paint_refresh_icon,
+                        )
+                        .clicked()
+                        {
                             if self.collect_update_targets().is_empty() {
                                 self.logs.push_str(">>> Нет доступных обновлений.\n");
+                                self.status = StatusMessage::new(
+                                    StatusTone::Success,
+                                    "Обновления не требуются",
+                                    "Все компоненты уже актуальны",
+                                    None,
+                                );
                             } else {
                                 self.show_update_confirm = true;
                                 self.center_confirm_window_on_open = true;
@@ -949,10 +1393,9 @@ impl eframe::App for YtDlpApp {
 
             ui.add_space(10.0);
 
-            // --- БЛОК ССЫЛОК (В СТИЛЕ LOADERSPOT) ---
             egui::Frame::none()
                 .fill(UiTheme::GROUP_BG)
-                .stroke(egui::Stroke::new(1.0, UiTheme::STROKE)) // Рамка группы
+                .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
                 .inner_margin(8.0)
                 .rounding(4.0)
                 .show(ui, |ui| {
@@ -978,7 +1421,6 @@ impl eframe::App for YtDlpApp {
                     ui.add_space(8.0);
                     ui.label("Вставить ссылку:");
 
-                    // Input Field с рамкой
                     egui::Frame::none()
                         .fill(UiTheme::INPUT_BG)
                         .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
@@ -1010,7 +1452,6 @@ impl eframe::App for YtDlpApp {
 
             ui.add_space(10.0);
 
-            // --- БЛОК КОНФИГА ---
             egui::Frame::none()
                 .fill(UiTheme::GROUP_BG)
                 .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
@@ -1041,7 +1482,6 @@ impl eframe::App for YtDlpApp {
 
             ui.add_space(10.0);
 
-            // --- БЛОК КОМПОНЕНТОВ ---
             egui::Frame::none()
                 .fill(UiTheme::GROUP_BG)
                 .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
@@ -1055,52 +1495,52 @@ impl eframe::App for YtDlpApp {
                             .color(egui::Color32::GRAY),
                     );
 
-                    egui::ScrollArea::vertical()
-                        .id_salt("components_scroll")
-                        .max_height(80.0)
-                        .min_scrolled_height(80.0)
-                        .show(ui, |ui| {
-                            if self.component_states.is_empty() {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("⌛ Проверка...").weak());
-                                });
-                            } else {
-                                for component in &self.component_states {
-                                    let (color, status_text) = self.component_badge(ui, component);
-                                    ui.horizontal(|ui| {
-                                        Self::draw_status_dot(ui, color);
-                                        let title = egui::RichText::new(&component.title).strong();
-                                        if component.status == updater::ComponentStatus::UpToDate {
-                                            ui.label(title);
-                                            ui.label(
-                                                egui::RichText::new(
-                                                    component
-                                                        .local_version
-                                                        .as_deref()
-                                                        .unwrap_or("?"),
-                                                )
-                                                .weak(),
-                                            );
-                                        } else if component.status
-                                            == updater::ComponentStatus::Missing
-                                        {
-                                            ui.label(title);
-                                            ui.label(
-                                                egui::RichText::new(status_text)
-                                                    .color(ui.visuals().error_fg_color),
-                                            );
-                                        } else {
-                                            ui.label(title);
-                                            ui.label(format!(
-                                                "{} -> {}",
-                                                component.local_version.as_deref().unwrap_or("?"),
-                                                component.latest_version.as_deref().unwrap_or("?")
-                                            ));
-                                        }
-                                    });
+                    ui.add_space(4.0);
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), COMPONENT_LIST_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    let mut list_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+                    );
+
+                    if self.component_states.is_empty() {
+                        for row in 0..3 {
+                            Self::draw_component_skeleton_row(&mut list_ui, row);
+                        }
+                    } else {
+                        for component in &self.component_states {
+                            let (color, status_text) = self.component_badge(&list_ui, component);
+                            list_ui.horizontal(|ui| {
+                                Self::draw_status_dot(ui, color);
+                                let title = egui::RichText::new(&component.title).strong();
+                                if component.status == updater::ComponentStatus::UpToDate {
+                                    ui.label(title);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            component.local_version.as_deref().unwrap_or("?"),
+                                        )
+                                        .weak(),
+                                    );
+                                } else if component.status == updater::ComponentStatus::Missing {
+                                    ui.label(title);
+                                    ui.label(
+                                        egui::RichText::new(status_text)
+                                            .color(ui.visuals().error_fg_color),
+                                    );
+                                } else {
+                                    ui.label(title);
+                                    ui.label(format!(
+                                        "{} -> {}",
+                                        component.local_version.as_deref().unwrap_or("?"),
+                                        component.latest_version.as_deref().unwrap_or("?")
+                                    ));
                                 }
-                            }
-                        });
+                            });
+                        }
+                    }
                 });
 
             ui.add_space(10.0);
@@ -1133,35 +1573,81 @@ impl eframe::App for YtDlpApp {
                         );
                     }
                 } else {
-                    ui.spinner();
-                    ui.label("Работаю...");
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new("СКАЧИВАЕТСЯ").min_size(egui::vec2(120.0, 36.0)),
+                    );
                 }
             });
 
             ui.add_space(10.0);
 
-            egui::Frame::none()
-                .fill(UiTheme::INPUT_BG) // Темный фон для лога
-                .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
-                .inner_margin(4.0)
-                .rounding(4.0)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add_sized(
-                                [ui.available_width(), ui.available_height()],
-                                egui::TextEdit::multiline(&mut self.logs)
-                                    .font(egui::TextStyle::Body)
-                                    .desired_width(f32::INFINITY)
-                                    .frame(false)
-                                    .interactive(false),
-                            );
-                        });
+            self.draw_status_panel(ui);
+
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                let line_count = self.logs.lines().count();
+                let has_logs = line_count > 0;
+                let label = if self.show_logs {
+                    "Скрыть лог"
+                } else {
+                    "Показать лог"
+                };
+                ui.add_enabled_ui(has_logs, |ui| {
+                    if Self::draw_button_with_icon(
+                        ui,
+                        label,
+                        egui::vec2(126.0, 30.0),
+                        Self::paint_log_icon,
+                    )
+                    .clicked()
+                    {
+                        self.show_logs = !self.show_logs;
+                        Self::apply_log_window_size(ctx, self.show_logs);
+                    }
                 });
+
+                let log_hint = if line_count == 0 {
+                    "Лог пуст".to_string()
+                } else {
+                    format!("Строк в логе: {line_count}")
+                };
+                ui.label(
+                    egui::RichText::new(log_hint)
+                        .small()
+                        .color(egui::Color32::from_gray(135)),
+                );
+            });
+            ui.add_space(14.0);
+
+            if self.show_logs {
+                egui::Frame::none()
+                    .fill(UiTheme::INPUT_BG)
+                    .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+                    .inner_margin(4.0)
+                    .rounding(4.0)
+                    .show(ui, |ui| {
+                        ui.set_min_height(LOG_AREA_HEIGHT);
+                        egui::ScrollArea::vertical()
+                            .id_salt("download_log")
+                            .stick_to_bottom(true)
+                            .max_height(LOG_AREA_HEIGHT)
+                            .show(ui, |ui| {
+                                ui.add_sized(
+                                    [ui.available_width(), LOG_AREA_HEIGHT],
+                                    egui::TextEdit::multiline(&mut self.logs)
+                                        .font(egui::TextStyle::Body)
+                                        .desired_width(f32::INFINITY)
+                                        .frame(false)
+                                        .interactive(false),
+                                );
+                            });
+                    });
+                ui.add_space(8.0);
+            }
         });
 
-        // --- ОКНО ПОДТВЕРЖДЕНИЯ ---
         if self.show_update_confirm {
             let viewport_id = Self::update_confirm_viewport_id();
             let mut approve = false;
@@ -1169,7 +1655,7 @@ impl eframe::App for YtDlpApp {
             let targets = self.collect_update_targets();
 
             let confirm_width = 470.0;
-            let confirm_height = 180.0; // Чуть выше
+            let confirm_height = 180.0;
             let mut viewport_builder = egui::ViewportBuilder::default()
                 .with_title("Update")
                 .with_inner_size([confirm_width, confirm_height])
@@ -1194,7 +1680,6 @@ impl eframe::App for YtDlpApp {
                             ui.label("Подтвердите обновление компонентов:");
                             ui.add_space(12.0);
 
-                            // "Терминальный" список
                             egui::Frame::none()
                                 .fill(UiTheme::INPUT_BG)
                                 .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
@@ -1212,7 +1697,7 @@ impl eframe::App for YtDlpApp {
                                                         ui.cursor().min + egui::vec2(4.0, 10.0),
                                                         3.0,
                                                         egui::Color32::from_rgb(255, 165, 0),
-                                                    ); // Оранжевая точка
+                                                    );
                                                     ui.add_space(10.0);
                                                     ui.label(
                                                         egui::RichText::new(&item.title)
@@ -1260,11 +1745,41 @@ impl eframe::App for YtDlpApp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::YtDlpApp;
+
+    #[test]
+    fn extracts_plain_yt_dlp_error() {
+        assert_eq!(
+            YtDlpApp::extract_yt_dlp_error_line("ERROR: video unavailable"),
+            Some("video unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_prefixed_stderr_error() {
+        assert_eq!(
+            YtDlpApp::extract_yt_dlp_error_line("stderr | ERROR: private video"),
+            Some("private video".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_regular_output() {
+        assert_eq!(
+            YtDlpApp::extract_yt_dlp_error_line("[download] 42.0% of 12.00MiB"),
+            None
+        );
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([500.0, 640.0])
-            .with_min_inner_size([500.0, 640.0])
+            .with_inner_size(COMPACT_WINDOW_SIZE)
+            .with_min_inner_size(COMPACT_WINDOW_SIZE)
+            .with_max_inner_size(COMPACT_WINDOW_SIZE)
             .with_resizable(false)
             .with_maximize_button(false),
         centered: true,
