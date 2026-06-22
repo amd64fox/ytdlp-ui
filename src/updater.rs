@@ -63,37 +63,38 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
     let client = match http_client() {
         Ok(client) => Some(client),
         Err(err) => {
-            warnings.push(format!(">>> Не удалось создать HTTP-клиент для проверки обновлений: {err}"));
+            warnings.push(format!(
+                ">>> Не удалось создать HTTP-клиент для проверки обновлений: {err}"
+            ));
             None
         }
     };
 
     let yt_local = read_version_from_binary(&app_dir.join("yt-dlp.exe"), &["--version"]);
-    let yt_release = client.as_ref().and_then(|client| match fetch_release(client, YT_DLP_RELEASES_API) {
-        Ok(release) => Some(release),
-        Err(err) => {
-            warnings.push(format!(">>> Не удалось получить релиз yt-dlp: {err}"));
-            None
-        }
+    let yt_release =
+        client
+            .as_ref()
+            .and_then(|client| match fetch_release(client, YT_DLP_RELEASES_API) {
+                Ok(release) => Some(release),
+                Err(err) => {
+                    warnings.push(format!(">>> Не удалось получить релиз yt-dlp: {err}"));
+                    None
+                }
+            });
+    let yt_asset = yt_release.as_ref().and_then(|release| {
+        release
+            .assets
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("yt-dlp.exe"))
+            .cloned()
     });
-    let yt_asset = yt_release
-        .as_ref()
-        .and_then(|release| {
-            release
-                .assets
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("yt-dlp.exe"))
-                .cloned()
-        });
-    let yt_checksum = yt_release
-        .as_ref()
-        .and_then(|release| {
-            release
-                .assets
-                .iter()
-                .find(|(name, _)| name.contains("SHA2-256SUMS"))
-                .map(|(_, url)| url.clone())
-        });
+    let yt_checksum = yt_release.as_ref().and_then(|release| {
+        release
+            .assets
+            .iter()
+            .find(|(name, _)| name.contains("SHA2-256SUMS"))
+            .map(|(_, url)| url.clone())
+    });
 
     components.push(build_component(
         ComponentKind::YtDlp,
@@ -110,34 +111,28 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
     let ffmpeg_local = read_version_from_binary(&ffmpeg_path, &["-version"]);
     let ffprobe_local = read_version_from_binary(&ffprobe_path, &["-version"]);
 
-    let ff_release = client.as_ref().and_then(|client| match fetch_release(client, FFMPEG_RELEASES_API) {
-        Ok(release) => Some(release),
-        Err(err) => {
-            warnings.push(format!(">>> Не удалось получить релиз ffmpeg: {err}"));
-            None
-        }
-    });
+    let ff_release =
+        client
+            .as_ref()
+            .and_then(|client| match fetch_release(client, FFMPEG_RELEASES_API) {
+                Ok(release) => Some(release),
+                Err(err) => {
+                    warnings.push(format!(">>> Не удалось получить релиз ffmpeg: {err}"));
+                    None
+                }
+            });
     let ff_asset = ff_release.as_ref().and_then(|release| {
         release
             .assets
             .iter()
-            .find(|(name, _)| {
-                let lower = name.to_lowercase();
-                lower.contains("ffmpeg-release-essentials")
-                    && Path::new(&lower)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
-            })
+            .find(|(name, _)| is_ffmpeg_essentials_zip_asset(name))
             .cloned()
     });
     let ff_checksum = ff_release.as_ref().and_then(|release| {
         release
             .assets
             .iter()
-            .find(|(name, _)| {
-                let lower = name.to_lowercase();
-                lower.contains("ffmpeg-release-essentials") && lower.contains("sha256")
-            })
+            .find(|(name, _)| is_ffmpeg_essentials_checksum_asset(name))
             .map(|(_, url)| url.clone())
     });
 
@@ -167,12 +162,15 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
     }
 }
 
-pub fn install_component(app_dir: &Path, component: &ComponentInfo) -> Result<InstallResult, String> {
+pub fn install_component(
+    app_dir: &Path,
+    component: &ComponentInfo,
+) -> Result<InstallResult, String> {
     let client = http_client()?;
     let download_url = component
         .download_url
         .as_ref()
-        .ok_or_else(|| format!("{}: ссылка на загрузку не найдена", component.title))?;
+        .ok_or_else(|| "ссылка на загрузку не найдена".to_string())?;
     let asset_name = component.asset_name.as_deref();
 
     match component.kind {
@@ -200,7 +198,9 @@ pub fn install_component(app_dir: &Path, component: &ComponentInfo) -> Result<In
             )?;
             install_ffmpeg_from_zip(&zip_path, app_dir)?;
             let _ = fs::remove_file(&zip_path);
-            Ok(InstallResult::Installed("ffmpeg/ffprobe обновлены".to_string()))
+            Ok(InstallResult::Installed(
+                "ffmpeg/ffprobe обновлены".to_string(),
+            ))
         }
     }
 }
@@ -277,6 +277,26 @@ fn fetch_release(client: &Client, api_url: &str) -> Result<ReleaseInfo, String> 
     Ok(ReleaseInfo { tag, assets })
 }
 
+fn is_zip_asset(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
+}
+
+fn is_ffmpeg_essentials_zip_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    is_zip_asset(name)
+        && lower.contains("ffmpeg")
+        && (lower.contains("essentials_build") || lower.contains("release-essentials"))
+}
+
+fn is_ffmpeg_essentials_checksum_asset(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("sha256")
+        && lower.contains("ffmpeg")
+        && (lower.contains("essentials_build") || lower.contains("release-essentials"))
+}
+
 fn read_version_from_binary(binary_path: &Path, args: &[&str]) -> Option<String> {
     if !binary_path.exists() {
         return None;
@@ -300,7 +320,13 @@ fn read_version_from_binary(binary_path: &Path, args: &[&str]) -> Option<String>
         let parts: Vec<&str> = line.split_whitespace().collect();
         for (idx, part) in parts.iter().enumerate() {
             if *part == "version" && idx + 1 < parts.len() {
-                return Some(parts[idx + 1].split('-').next().unwrap_or(parts[idx + 1]).to_string());
+                return Some(
+                    parts[idx + 1]
+                        .split('-')
+                        .next()
+                        .unwrap_or(parts[idx + 1])
+                        .to_string(),
+                );
             }
         }
     }
@@ -344,7 +370,11 @@ fn compare_versions(local: &str, latest: &str) -> Option<Ordering> {
 fn download_to_path(client: &Client, url: &str, out_path: &Path) -> Result<(), String> {
     let mut response = client.get(url).send().map_err(|e| e.to_string())?;
     if !response.status().is_success() {
-        return Err(format!("Ошибка загрузки {}: HTTP {}", url, response.status()));
+        return Err(format!(
+            "Ошибка загрузки {}: HTTP {}",
+            url,
+            response.status()
+        ));
     }
 
     let mut output = File::create(out_path).map_err(|e| e.to_string())?;
@@ -358,7 +388,9 @@ fn verify_checksum_if_present(
     checksum_url: Option<&str>,
     expected_asset_name: Option<&str>,
 ) -> Result<(), String> {
-    let Some(url) = checksum_url else { return Ok(()); };
+    let Some(url) = checksum_url else {
+        return Ok(());
+    };
     let body = client
         .get(url)
         .send()
@@ -422,7 +454,9 @@ fn verify_checksum_if_present(
     let actual = format!("{:x}", hasher.finalize());
 
     if actual != expected {
-        return Err(format!("Checksum mismatch: expected {expected}, got {actual}"));
+        return Err(format!(
+            "Checksum mismatch: expected {expected}, got {actual}"
+        ));
     }
 
     Ok(())

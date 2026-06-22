@@ -2,8 +2,8 @@
 
 mod updater;
 
-use encoding_rs::WINDOWS_1251;
 use eframe::egui;
+use encoding_rs::WINDOWS_1251;
 use std::env;
 use std::fs::{self};
 use std::io::{BufRead, BufReader, ErrorKind, Read};
@@ -28,15 +28,13 @@ const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
 ];
 
 fn current_app_dir() -> PathBuf {
-    env::current_exe()
-        .ok()
-        .map_or_else(
-            || PathBuf::from("."),
-            |mut path| {
-                path.pop();
-                path
-            },
-        )
+    env::current_exe().ok().map_or_else(
+        || PathBuf::from("."),
+        |mut path| {
+            path.pop();
+            path
+        },
+    )
 }
 
 fn resolve_config_path(app_dir: &Path) -> PathBuf {
@@ -45,7 +43,9 @@ fn resolve_config_path(app_dir: &Path) -> PathBuf {
     }
 
     if let Some(base_dir) = env::var_os("LOCALAPPDATA").or_else(|| env::var_os("APPDATA")) {
-        return PathBuf::from(base_dir).join(APP_CONFIG_DIR).join(CONFIG_FILE);
+        return PathBuf::from(base_dir)
+            .join(APP_CONFIG_DIR)
+            .join(CONFIG_FILE);
     }
 
     app_dir.join(CONFIG_FILE)
@@ -387,12 +387,25 @@ impl YtDlpApp {
         });
 
         if ff_bundle_needed {
-            if let Some(template) = self.component_states.iter().find(|comp| {
-                matches!(
-                    comp.kind,
-                    updater::ComponentKind::Ffmpeg | updater::ComponentKind::Ffprobe
-                )
-            }) {
+            let template = self
+                .component_states
+                .iter()
+                .find(|comp| {
+                    matches!(
+                        comp.kind,
+                        updater::ComponentKind::Ffmpeg | updater::ComponentKind::Ffprobe
+                    ) && comp.download_url.is_some()
+                })
+                .or_else(|| {
+                    self.component_states.iter().find(|comp| {
+                        matches!(
+                            comp.kind,
+                            updater::ComponentKind::Ffmpeg | updater::ComponentKind::Ffprobe
+                        )
+                    })
+                });
+
+            if let Some(template) = template {
                 let mut bundled = template.clone();
                 bundled.kind = updater::ComponentKind::Ffmpeg;
                 bundled.title = "ffmpeg/ffprobe".to_string();
@@ -421,8 +434,9 @@ impl YtDlpApp {
 
         let yt_dlp_path = self.managed_yt_dlp_path();
         if !yt_dlp_path.is_file() {
-            self.logs
-                .push_str(">>> yt-dlp.exe не найден. Сначала установите его через кнопку обновления.\n");
+            self.logs.push_str(
+                ">>> yt-dlp.exe не найден. Сначала установите его через кнопку обновления.\n",
+            );
             return;
         }
 
@@ -449,12 +463,11 @@ impl YtDlpApp {
         thread::spawn(move || {
             let clean_path = path.trim_end_matches('\\');
             for (i, url) in valid_urls.iter().enumerate() {
-                Self::send_log(&sender, &thread_ctx, format!(
-                    ">>> [{}/{}] {}",
-                    i + 1,
-                    total,
-                    url
-                ));
+                Self::send_log(
+                    &sender,
+                    &thread_ctx,
+                    format!(">>> [{}/{}] {}", i + 1, total, url),
+                );
                 let output_template = format!(r"{clean_path}/%(title)s.%(ext)s");
                 let mut args = vec!["--newline".to_string()];
                 for arg_line in &config_args {
@@ -476,12 +489,7 @@ impl YtDlpApp {
                 match child {
                     Ok(mut child_process) => {
                         let stdout_handle = child_process.stdout.take().map(|stdout| {
-                            Self::spawn_pipe_reader(
-                                stdout,
-                                sender.clone(),
-                                thread_ctx.clone(),
-                                "",
-                            )
+                            Self::spawn_pipe_reader(stdout, sender.clone(), thread_ctx.clone(), "")
                         });
                         let stderr_handle = child_process.stderr.take().map(|stderr| {
                             Self::spawn_pipe_reader(
@@ -502,9 +510,10 @@ impl YtDlpApp {
                                 }
 
                                 if !status.success() {
-                                    let exit_code = status
-                                        .code()
-                                        .map_or_else(|| "без кода".to_string(), |code| code.to_string());
+                                    let exit_code = status.code().map_or_else(
+                                        || "без кода".to_string(),
+                                        |code| code.to_string(),
+                                    );
                                     Self::send_log(
                                         &sender,
                                         &thread_ctx,
@@ -522,7 +531,11 @@ impl YtDlpApp {
                         }
                     }
                     Err(e) => {
-                        Self::send_log(&sender, &thread_ctx, format!("❌ Ошибка запуска yt-dlp: {e}"));
+                        Self::send_log(
+                            &sender,
+                            &thread_ctx,
+                            format!("❌ Ошибка запуска yt-dlp: {e}"),
+                        );
                     }
                 }
             }
@@ -663,11 +676,17 @@ impl YtDlpApp {
             stroke,
         );
         painter.line_segment(
-            [egui::pos2(left, center_y), egui::pos2(left + 5.0, rect.top() + 2.0)],
+            [
+                egui::pos2(left, center_y),
+                egui::pos2(left + 5.0, rect.top() + 2.0),
+            ],
             stroke,
         );
         painter.line_segment(
-            [egui::pos2(left, center_y), egui::pos2(left + 5.0, rect.bottom() - 2.0)],
+            [
+                egui::pos2(left, center_y),
+                egui::pos2(left + 5.0, rect.bottom() - 2.0),
+            ],
             stroke,
         );
     }
@@ -1110,8 +1129,7 @@ impl eframe::App for YtDlpApp {
 
                     if !downloader_ready && !is_checking {
                         ui.label(
-                            egui::RichText::new("Сначала установите yt-dlp через Обновить.")
-                                .weak(),
+                            egui::RichText::new("Сначала установите yt-dlp через Обновить.").weak(),
                         );
                     }
                 } else {
