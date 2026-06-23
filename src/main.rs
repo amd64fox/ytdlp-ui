@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize};
 const CONFIG_FILE: &str = "config.toml";
 const APP_CONFIG_DIR: &str = "ytdlp-ui";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const COMPACT_WINDOW_SIZE: [f32; 2] = [500.0, 524.0];
-const LOG_WINDOW_SIZE: [f32; 2] = [500.0, 724.0];
+const COMPACT_WINDOW_SIZE: [f32; 2] = [500.0, 456.0];
+const LOG_WINDOW_SIZE: [f32; 2] = [500.0, 656.0];
+const SETTINGS_WINDOW_SIZE: [f32; 2] = [500.0, 178.0];
 const LOG_AREA_HEIGHT: f32 = 160.0;
 const COMPONENT_LIST_HEIGHT: f32 = 62.0;
 const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
@@ -282,8 +283,10 @@ struct YtDlpApp {
     is_working: bool,
     show_logs: bool,
     show_url_editor: bool,
+    show_settings: bool,
     show_update_confirm: bool,
     center_confirm_window_on_open: bool,
+    center_settings_window_on_open: bool,
 
     receiver: Receiver<AppMessage>,
     sender: Sender<AppMessage>,
@@ -296,6 +299,10 @@ struct YtDlpApp {
 impl YtDlpApp {
     fn update_confirm_viewport_id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("update_confirm_viewport")
+    }
+
+    fn settings_viewport_id() -> egui::ViewportId {
+        egui::ViewportId::from_hash_of("settings_viewport")
     }
 
     fn send_log(sender: &Sender<AppMessage>, ctx: &egui::Context, message: impl Into<String>) {
@@ -396,6 +403,66 @@ impl YtDlpApp {
         self.app_dir.join("yt-dlp.exe")
     }
 
+    fn open_in_explorer(path: &Path) -> Result<(), String> {
+        Command::new("explorer")
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+
+    fn open_output_path(&mut self) {
+        let path = PathBuf::from(&self.config.output_path);
+        if let Err(err) = fs::create_dir_all(&path) {
+            self.set_local_error("Не удалось открыть папку", err.to_string());
+            return;
+        }
+
+        if let Err(err) = Self::open_in_explorer(&path) {
+            self.set_local_error("Не удалось открыть папку", err);
+        }
+    }
+
+    fn open_config_file(&mut self) {
+        if let Err(err) = self.config.save(&self.config_path) {
+            self.set_local_error("Не удалось сохранить конфиг", err);
+            return;
+        }
+
+        if let Err(err) = Self::open_in_explorer(&self.config_path) {
+            self.set_local_error("Не удалось открыть конфиг", err);
+        }
+    }
+
+    fn choose_output_path(&mut self) {
+        let start_dir = PathBuf::from(&self.config.output_path);
+        let mut dialog = rfd::FileDialog::new().set_title("Выберите папку сохранения");
+
+        if start_dir.is_dir() {
+            dialog = dialog.set_directory(&start_dir);
+        }
+
+        if let Some(path) = dialog.pick_folder() {
+            self.config.output_path = path.to_string_lossy().to_string();
+            match self.config.save(&self.config_path) {
+                Ok(()) => {
+                    self.status = StatusMessage::new(
+                        StatusTone::Success,
+                        "Путь сохранения обновлен",
+                        self.config.output_path.clone(),
+                        None,
+                    );
+                    self.logs.push_str(&format!(
+                        ">>> Путь сохранения: {}\n",
+                        self.config.output_path
+                    ));
+                }
+                Err(err) => self.set_local_error("Не удалось сохранить конфиг", err),
+            }
+        }
+    }
+
     fn spawn_update_check(sender: Sender<AppMessage>, ctx: egui::Context, app_dir: PathBuf) {
         thread::spawn(move || {
             let report = updater::check_for_updates(&app_dir);
@@ -451,8 +518,10 @@ impl YtDlpApp {
             is_working: false,
             show_logs: false,
             show_url_editor: false,
+            show_settings: false,
             show_update_confirm: false,
             center_confirm_window_on_open: false,
+            center_settings_window_on_open: false,
             receiver,
             sender,
             component_states: Vec::new(),
@@ -1032,7 +1101,7 @@ impl YtDlpApp {
             painter.rect_filled(rect, rounding, visuals.bg_fill);
             painter.rect_stroke(rect, rounding, visuals.bg_stroke);
 
-            let icon_rect = rect.shrink2(egui::vec2(7.0, 7.0));
+            let icon_rect = rect.shrink2(egui::vec2(5.5, 5.5));
             icon(painter, icon_rect, visuals.fg_stroke.color);
         }
 
@@ -1120,6 +1189,213 @@ impl YtDlpApp {
         }
     }
 
+    fn svg_pos(rect: egui::Rect, x: f32, y: f32) -> egui::Pos2 {
+        egui::pos2(
+            rect.left() + rect.width() * x / 24.0,
+            rect.top() + rect.height() * y / 24.0,
+        )
+    }
+
+    fn svg_line(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        stroke: egui::Stroke,
+        from: (f32, f32),
+        to: (f32, f32),
+    ) {
+        painter.line_segment(
+            [
+                Self::svg_pos(rect, from.0, from.1),
+                Self::svg_pos(rect, to.0, to.1),
+            ],
+            stroke,
+        );
+    }
+
+    fn svg_polyline(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        stroke: egui::Stroke,
+        points: &[(f32, f32)],
+    ) {
+        for pair in points.windows(2) {
+            Self::svg_line(painter, rect, stroke, pair[0], pair[1]);
+        }
+    }
+
+    fn svg_circle(
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        center: (f32, f32),
+        radius: f32,
+        stroke: egui::Stroke,
+    ) {
+        let scale = rect.width().min(rect.height()) / 24.0;
+        painter.circle_stroke(
+            Self::svg_pos(rect, center.0, center.1),
+            radius * scale,
+            stroke,
+        );
+    }
+
+    fn paint_folder_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.85, color);
+        Self::svg_polyline(
+            painter,
+            rect,
+            stroke,
+            &[
+                (2.0, 11.5),
+                (2.0, 5.0),
+                (4.0, 3.0),
+                (7.9, 3.0),
+                (9.6, 3.9),
+                (10.4, 5.1),
+                (12.1, 6.0),
+                (20.0, 6.0),
+                (22.0, 8.0),
+                (22.0, 18.0),
+                (20.0, 20.0),
+                (10.5, 20.0),
+            ],
+        );
+    }
+
+    fn paint_folder_edit_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        Self::paint_folder_icon(painter, rect, color);
+        let stroke = egui::Stroke::new(1.85, color);
+        Self::svg_polyline(
+            painter,
+            rect,
+            stroke,
+            &[
+                (11.4, 13.6),
+                (8.4, 10.6),
+                (3.4, 15.6),
+                (2.9, 16.5),
+                (2.0, 19.4),
+                (2.6, 20.0),
+                (5.5, 19.1),
+                (6.4, 18.6),
+                (11.4, 13.6),
+            ],
+        );
+        Self::svg_line(painter, rect, stroke, (8.4, 10.6), (11.4, 13.6));
+    }
+
+    fn paint_open_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.85, color);
+        Self::svg_polyline(
+            painter,
+            rect,
+            stroke,
+            &[
+                (6.0, 14.0),
+                (7.5, 11.1),
+                (9.2, 10.0),
+                (20.0, 10.0),
+                (21.9, 12.5),
+                (20.4, 18.5),
+                (18.5, 20.0),
+                (4.0, 20.0),
+                (2.0, 18.0),
+                (2.0, 5.0),
+                (4.0, 3.0),
+                (7.9, 3.0),
+                (9.6, 3.9),
+                (10.4, 5.1),
+                (12.1, 6.0),
+                (18.0, 6.0),
+                (20.0, 8.0),
+                (20.0, 10.0),
+            ],
+        );
+    }
+
+    fn paint_config_file_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.75, color);
+        Self::svg_polyline(
+            painter,
+            rect,
+            stroke,
+            &[
+                (10.3, 20.0),
+                (4.0, 20.0),
+                (2.0, 18.0),
+                (2.0, 5.0),
+                (4.0, 3.0),
+                (8.0, 3.0),
+                (9.7, 3.9),
+                (10.3, 5.1),
+                (12.0, 6.0),
+                (20.0, 6.0),
+                (22.0, 8.0),
+                (22.0, 11.3),
+            ],
+        );
+
+        for (from, to) in [
+            ((14.3, 19.5), (15.2, 19.1)),
+            ((15.2, 16.9), (14.3, 16.5)),
+            ((16.9, 15.2), (16.5, 14.3)),
+            ((16.9, 20.8), (16.5, 21.7)),
+            ((19.1, 15.2), (19.5, 14.3)),
+            ((19.5, 21.7), (19.1, 20.8)),
+            ((20.8, 16.9), (21.7, 16.5)),
+            ((20.8, 19.1), (21.7, 19.5)),
+        ] {
+            Self::svg_line(painter, rect, stroke, from, to);
+        }
+        Self::svg_circle(painter, rect, (18.0, 18.0), 3.0, stroke);
+    }
+
+    fn paint_settings_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+        let stroke = egui::Stroke::new(1.75, color);
+        Self::svg_polyline(
+            painter,
+            rect,
+            stroke,
+            &[
+                (9.7, 4.1),
+                (11.0, 2.1),
+                (13.0, 2.1),
+                (14.3, 4.1),
+                (14.9, 5.8),
+                (16.8, 6.0),
+                (19.0, 5.3),
+                (20.3, 6.8),
+                (20.7, 8.7),
+                (19.6, 10.1),
+                (18.6, 12.0),
+                (19.6, 13.9),
+                (20.7, 15.3),
+                (20.3, 17.2),
+                (19.0, 18.7),
+                (16.8, 18.0),
+                (14.9, 18.2),
+                (14.3, 19.9),
+                (13.0, 21.9),
+                (11.0, 21.9),
+                (9.7, 19.9),
+                (9.1, 18.2),
+                (7.2, 18.0),
+                (5.0, 18.7),
+                (3.7, 17.2),
+                (3.3, 15.3),
+                (4.4, 13.9),
+                (5.4, 12.0),
+                (4.4, 10.1),
+                (3.3, 8.7),
+                (3.7, 6.8),
+                (5.0, 5.3),
+                (7.2, 6.0),
+                (9.1, 5.8),
+                (9.7, 4.1),
+            ],
+        );
+        Self::svg_circle(painter, rect, (12.0, 12.0), 3.0, stroke);
+    }
+
     fn paint_trash_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         let stroke = egui::Stroke::new(1.6, color);
 
@@ -1178,6 +1454,97 @@ impl YtDlpApp {
             ],
             stroke,
         );
+    }
+
+    fn draw_settings_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+            .fill(UiTheme::GROUP_BG)
+            .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+            .inner_margin(8.0)
+            .rounding(4.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Путь сохранения")
+                            .strong()
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Self::draw_icon_only_button(
+                            ui,
+                            egui::vec2(28.0, 28.0),
+                            Self::paint_folder_edit_icon,
+                        )
+                        .on_hover_text("Изменить путь сохранения")
+                        .clicked()
+                        {
+                            self.choose_output_path();
+                        }
+
+                        if Self::draw_icon_only_button(
+                            ui,
+                            egui::vec2(28.0, 28.0),
+                            Self::paint_open_icon,
+                        )
+                        .on_hover_text("Открыть папку сохранения")
+                        .clicked()
+                        {
+                            self.open_output_path();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(UiTheme::INPUT_BG)
+                    .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+                    .rounding(4.0)
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.output_path)
+                                .frame(false)
+                                .interactive(false)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Файл конфигурации")
+                            .strong()
+                            .color(egui::Color32::GRAY),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Self::draw_icon_only_button(
+                            ui,
+                            egui::vec2(28.0, 28.0),
+                            Self::paint_config_file_icon,
+                        )
+                        .on_hover_text("Открыть файл конфигурации")
+                        .clicked()
+                        {
+                            self.open_config_file();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(UiTheme::INPUT_BG)
+                    .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
+                    .rounding(4.0)
+                    .inner_margin(4.0)
+                    .show(ui, |ui| {
+                        let mut config_path = self.config_path.to_string_lossy().to_string();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut config_path)
+                                .frame(false)
+                                .interactive(false)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            });
     }
 
     fn draw_url_editor(&mut self, ui: &mut egui::Ui) {
@@ -1242,7 +1609,7 @@ impl YtDlpApp {
                                             egui::TextEdit::singleline(url)
                                                 .desired_width(width)
                                                 .frame(false)
-                                                .hint_text("https://...")
+                                                .hint_text("https://www.youtube.com/watch?v=...")
                                                 .margin(egui::vec2(0.0, 0.0)),
                                         );
                                         text_edit.context_menu(|ui| {
@@ -1365,6 +1732,20 @@ impl eframe::App for YtDlpApp {
             ui.horizontal(|ui| {
                 ui.heading("YouTube Downloader");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Self::draw_icon_only_button(
+                        ui,
+                        egui::vec2(30.0, 30.0),
+                        Self::paint_settings_icon,
+                    )
+                    .on_hover_text("Настройки")
+                    .clicked()
+                    {
+                        self.show_settings = true;
+                        self.center_settings_window_on_open = true;
+                    }
+
+                    ui.add_space(6.0);
+
                     if !self.is_working {
                         if Self::draw_button_with_icon(
                             ui,
@@ -1431,7 +1812,7 @@ impl eframe::App for YtDlpApp {
                                 egui::TextEdit::singleline(&mut self.urls[0])
                                     .desired_width(f32::INFINITY)
                                     .frame(false)
-                                    .hint_text("https://..."),
+                                    .hint_text("https://www.youtube.com/watch?v=..."),
                             );
                             url_edit.context_menu(|ui| {
                                 if ui.button("Вставить").clicked() {
@@ -1447,36 +1828,6 @@ impl eframe::App for YtDlpApp {
                                     ui.close_menu();
                                 }
                             });
-                        });
-                });
-
-            ui.add_space(10.0);
-
-            egui::Frame::none()
-                .fill(UiTheme::GROUP_BG)
-                .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
-                .inner_margin(8.0)
-                .rounding(4.0)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        egui::RichText::new("Путь сохранения")
-                            .strong()
-                            .color(egui::Color32::GRAY),
-                    );
-                    ui.add_space(4.0);
-                    egui::Frame::none()
-                        .fill(UiTheme::INPUT_BG)
-                        .stroke(egui::Stroke::new(1.0, UiTheme::STROKE))
-                        .rounding(4.0)
-                        .inner_margin(4.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.config.output_path)
-                                    .frame(false)
-                                    .interactive(false)
-                                    .desired_width(f32::INFINITY),
-                            );
                         });
                 });
 
@@ -1619,7 +1970,7 @@ impl eframe::App for YtDlpApp {
                         .color(egui::Color32::from_gray(135)),
                 );
             });
-            ui.add_space(14.0);
+            ui.add_space(8.0);
 
             if self.show_logs {
                 egui::Frame::none()
@@ -1647,6 +1998,45 @@ impl eframe::App for YtDlpApp {
                 ui.add_space(8.0);
             }
         });
+
+        if self.show_settings {
+            let viewport_id = Self::settings_viewport_id();
+            let [settings_width, settings_height] = SETTINGS_WINDOW_SIZE;
+            let mut close_settings = false;
+            let mut viewport_builder = egui::ViewportBuilder::default()
+                .with_title("Настройки")
+                .with_inner_size(SETTINGS_WINDOW_SIZE)
+                .with_min_inner_size(SETTINGS_WINDOW_SIZE)
+                .with_max_inner_size(SETTINGS_WINDOW_SIZE)
+                .with_resizable(false)
+                .with_maximize_button(false);
+
+            if self.center_settings_window_on_open {
+                if let Some(ms) = ctx.input(|i| i.viewport().monitor_size) {
+                    let pos = egui::pos2(
+                        (ms.x - settings_width) / 2.0,
+                        (ms.y - settings_height) / 2.0,
+                    );
+                    viewport_builder = viewport_builder.with_position(pos);
+                }
+                self.center_settings_window_on_open = false;
+            }
+
+            ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(UiTheme::BG).inner_margin(8.0))
+                    .show(ctx, |ui| {
+                        self.draw_settings_panel(ui);
+                    });
+                if ctx.input(|i| i.viewport().close_requested()) {
+                    close_settings = true;
+                }
+            });
+
+            if close_settings {
+                self.show_settings = false;
+            }
+        }
 
         if self.show_update_confirm {
             let viewport_id = Self::update_confirm_viewport_id();
