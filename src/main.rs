@@ -25,7 +25,6 @@ const APP_CONFIG_DIR: &str = "ytdlp-ui";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const COMPACT_WINDOW_SIZE: [f32; 2] = [500.0, 456.0];
 const LOG_WINDOW_SIZE: [f32; 2] = [500.0, 656.0];
-const SETTINGS_WINDOW_SIZE: [f32; 2] = [500.0, 178.0];
 const LOG_AREA_HEIGHT: f32 = 160.0;
 const COMPONENT_LIST_HEIGHT: f32 = 62.0;
 const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
@@ -286,7 +285,6 @@ struct YtDlpApp {
     show_settings: bool,
     show_update_confirm: bool,
     center_confirm_window_on_open: bool,
-    center_settings_window_on_open: bool,
 
     receiver: Receiver<AppMessage>,
     sender: Sender<AppMessage>,
@@ -299,10 +297,6 @@ struct YtDlpApp {
 impl YtDlpApp {
     fn update_confirm_viewport_id() -> egui::ViewportId {
         egui::ViewportId::from_hash_of("update_confirm_viewport")
-    }
-
-    fn settings_viewport_id() -> egui::ViewportId {
-        egui::ViewportId::from_hash_of("settings_viewport")
     }
 
     fn send_log(sender: &Sender<AppMessage>, ctx: &egui::Context, message: impl Into<String>) {
@@ -521,7 +515,6 @@ impl YtDlpApp {
             show_settings: false,
             show_update_confirm: false,
             center_confirm_window_on_open: false,
-            center_settings_window_on_open: false,
             receiver,
             sender,
             component_states: Vec::new(),
@@ -1101,7 +1094,7 @@ impl YtDlpApp {
             painter.rect_filled(rect, rounding, visuals.bg_fill);
             painter.rect_stroke(rect, rounding, visuals.bg_stroke);
 
-            let icon_rect = rect.shrink2(egui::vec2(5.5, 5.5));
+            let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(14.0, 14.0));
             icon(painter, icon_rect, visuals.fg_stroke.color);
         }
 
@@ -1109,28 +1102,12 @@ impl YtDlpApp {
     }
 
     fn paint_back_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-        let stroke = egui::Stroke::new(1.8, color);
-        let center_y = rect.center().y;
-        let left = rect.left();
-        let right = rect.right();
-
-        painter.line_segment(
-            [egui::pos2(left, center_y), egui::pos2(right, center_y)],
+        let stroke = egui::Stroke::new(2.0, color);
+        Self::svg_polyline(
+            painter,
+            rect,
             stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(left, center_y),
-                egui::pos2(left + 5.0, rect.top() + 2.0),
-            ],
-            stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(left, center_y),
-                egui::pos2(left + 5.0, rect.bottom() - 2.0),
-            ],
-            stroke,
+            &[(15.0, 18.0), (9.0, 12.0), (15.0, 6.0)],
         );
     }
 
@@ -1153,24 +1130,37 @@ impl YtDlpApp {
     }
 
     fn paint_refresh_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-        let stroke = egui::Stroke::new(1.6, color);
-        let center = rect.center();
-        let radius = rect.width().min(rect.height()) * 0.42;
+        let stroke = egui::Stroke::new(1.8, color);
+        let mut path = Vec::with_capacity(35);
+        let arc_steps = 24;
 
-        painter.circle_stroke(center, radius, stroke);
-        painter.line_segment(
-            [
-                egui::pos2(rect.right() - 1.5, center.y - radius * 0.15),
-                egui::pos2(rect.right() - 1.5, rect.top() + 1.0),
-            ],
+        for step in 0..=arc_steps {
+            let angle = step as f32 / arc_steps as f32 * std::f32::consts::FRAC_PI_2 * 3.0;
+            path.push((12.0 + 9.0 * angle.cos(), 12.0 + 9.0 * angle.sin()));
+        }
+
+        for step in 1..=8 {
+            let t = step as f32 / 8.0;
+            let mt = 1.0 - t;
+            let x = mt * mt * mt * 12.0
+                + 3.0 * mt * mt * t * 14.52
+                + 3.0 * mt * t * t * 16.93
+                + t * t * t * 18.74;
+            let y = mt * mt * mt * 3.0
+                + 3.0 * mt * mt * t * 3.0
+                + 3.0 * mt * t * t * 4.0
+                + t * t * t * 5.74;
+            path.push((x, y));
+        }
+
+        path.push((21.0, 8.0));
+
+        Self::svg_polyline(painter, rect, stroke, &path);
+        Self::svg_polyline(
+            painter,
+            rect,
             stroke,
-        );
-        painter.line_segment(
-            [
-                egui::pos2(rect.right() - 1.5, rect.top() + 1.0),
-                egui::pos2(rect.right() - 6.0, rect.top() + 1.8),
-            ],
-            stroke,
+            &[(21.0, 3.0), (21.0, 8.0), (16.0, 8.0)],
         );
     }
 
@@ -1547,16 +1537,29 @@ impl YtDlpApp {
             });
     }
 
+    fn draw_settings_editor(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            if Self::draw_icon_only_button(ui, egui::vec2(28.0, 28.0), Self::paint_back_icon)
+                .on_hover_text("Назад")
+                .clicked()
+            {
+                self.show_settings = false;
+            }
+            ui.add_space(8.0);
+            ui.heading("Настройки");
+        });
+
+        ui.add_space(10.0);
+        self.draw_settings_panel(ui);
+    }
+
     fn draw_url_editor(&mut self, ui: &mut egui::Ui) {
         ui.add_space(5.0);
         ui.horizontal(|ui| {
-            if Self::draw_button_with_icon(
-                ui,
-                "Назад",
-                egui::vec2(84.0, 28.0),
-                Self::paint_back_icon,
-            )
-            .clicked()
+            if Self::draw_icon_only_button(ui, egui::vec2(28.0, 28.0), Self::paint_back_icon)
+                .on_hover_text("Назад")
+                .clicked()
             {
                 self.show_url_editor = false;
             }
@@ -1722,6 +1725,11 @@ impl eframe::App for YtDlpApp {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.show_settings {
+                self.draw_settings_editor(ui);
+                return;
+            }
+
             if self.show_url_editor {
                 self.draw_url_editor(ui);
                 return;
@@ -1741,18 +1749,17 @@ impl eframe::App for YtDlpApp {
                     .clicked()
                     {
                         self.show_settings = true;
-                        self.center_settings_window_on_open = true;
                     }
 
                     ui.add_space(6.0);
 
                     if !self.is_working {
-                        if Self::draw_button_with_icon(
+                        if Self::draw_icon_only_button(
                             ui,
-                            "Обновить",
-                            egui::vec2(96.0, 30.0),
+                            egui::vec2(30.0, 30.0),
                             Self::paint_refresh_icon,
                         )
+                        .on_hover_text("Обновить")
                         .clicked()
                         {
                             if self.collect_update_targets().is_empty() {
@@ -1998,45 +2005,6 @@ impl eframe::App for YtDlpApp {
                 ui.add_space(8.0);
             }
         });
-
-        if self.show_settings {
-            let viewport_id = Self::settings_viewport_id();
-            let [settings_width, settings_height] = SETTINGS_WINDOW_SIZE;
-            let mut close_settings = false;
-            let mut viewport_builder = egui::ViewportBuilder::default()
-                .with_title("Настройки")
-                .with_inner_size(SETTINGS_WINDOW_SIZE)
-                .with_min_inner_size(SETTINGS_WINDOW_SIZE)
-                .with_max_inner_size(SETTINGS_WINDOW_SIZE)
-                .with_resizable(false)
-                .with_maximize_button(false);
-
-            if self.center_settings_window_on_open {
-                if let Some(ms) = ctx.input(|i| i.viewport().monitor_size) {
-                    let pos = egui::pos2(
-                        (ms.x - settings_width) / 2.0,
-                        (ms.y - settings_height) / 2.0,
-                    );
-                    viewport_builder = viewport_builder.with_position(pos);
-                }
-                self.center_settings_window_on_open = false;
-            }
-
-            ctx.show_viewport_immediate(viewport_id, viewport_builder, |ctx, _class| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::none().fill(UiTheme::BG).inner_margin(8.0))
-                    .show(ctx, |ui| {
-                        self.draw_settings_panel(ui);
-                    });
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    close_settings = true;
-                }
-            });
-
-            if close_settings {
-                self.show_settings = false;
-            }
-        }
 
         if self.show_update_confirm {
             let viewport_id = Self::update_confirm_viewport_id();
