@@ -4444,6 +4444,7 @@ yt_dlp_args = [
             asset_name: Some("asset".to_string()),
             download_url: Some("https://example.com/asset".to_string()),
             checksum_url: None,
+            digest: None,
         }
     }
 

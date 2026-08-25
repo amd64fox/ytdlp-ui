@@ -14,7 +14,6 @@ const YT_DLP_RELEASES_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/re
 const FFMPEG_RELEASES_API: &str = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest";
 const APP_RELEASES_API: &str = "https://api.github.com/repos/amd64fox/ytdlp-ui/releases/latest";
 const APP_RELEASE_ASSET: &str = "ytdlp-ui-x64.exe";
-const APP_CHECKSUM_ASSET: &str = "SHA256SUMS.txt";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const APP_REPOSITORY_URL: &str = "https://github.com/amd64fox/ytdlp-ui";
@@ -46,6 +45,7 @@ pub struct ComponentInfo {
     pub asset_name: Option<String>,
     pub download_url: Option<String>,
     pub checksum_url: Option<String>,
+    pub digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +63,14 @@ pub enum InstallResult {
 #[derive(Clone, Debug)]
 struct ReleaseInfo {
     tag: String,
-    assets: Vec<(String, String)>,
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseAsset {
+    name: String,
+    url: String,
+    digest: Option<String>,
 }
 
 pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
@@ -93,15 +100,8 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         release
             .assets
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(APP_RELEASE_ASSET))
+            .find(|asset| asset.name.eq_ignore_ascii_case(APP_RELEASE_ASSET))
             .cloned()
-    });
-    let app_checksum = app_release.as_ref().and_then(|release| {
-        release
-            .assets
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(APP_CHECKSUM_ASSET))
-            .map(|(_, url)| url.clone())
     });
 
     components.push(build_component(
@@ -109,9 +109,10 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         "yt-dlp GUI",
         Some(APP_VERSION.to_string()),
         app_release.as_ref().map(|release| release.tag.clone()),
-        app_asset.clone().map(|(name, _)| name),
-        app_asset.map(|(_, url)| url),
-        app_checksum,
+        app_asset.as_ref().map(|asset| asset.name.clone()),
+        app_asset.as_ref().map(|asset| asset.url.clone()),
+        None,
+        app_asset.and_then(|asset| asset.digest),
     ));
 
     let yt_local = read_version_from_binary(&app_dir.join("yt-dlp.exe"), &["--version"]);
@@ -129,15 +130,15 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         release
             .assets
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("yt-dlp.exe"))
+            .find(|asset| asset.name.eq_ignore_ascii_case("yt-dlp.exe"))
             .cloned()
     });
     let yt_checksum = yt_release.as_ref().and_then(|release| {
         release
             .assets
             .iter()
-            .find(|(name, _)| name.contains("SHA2-256SUMS"))
-            .map(|(_, url)| url.clone())
+            .find(|asset| asset.name.contains("SHA2-256SUMS"))
+            .map(|asset| asset.url.clone())
     });
 
     components.push(build_component(
@@ -145,9 +146,10 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         "yt-dlp",
         yt_local,
         yt_release.as_ref().map(|r| r.tag.clone()),
-        yt_asset.clone().map(|(name, _)| name),
-        yt_asset.map(|(_, url)| url),
+        yt_asset.as_ref().map(|asset| asset.name.clone()),
+        yt_asset.map(|asset| asset.url),
         yt_checksum,
+        None,
     ));
 
     let ffmpeg_path = app_dir.join("ffmpeg.exe");
@@ -169,15 +171,15 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         release
             .assets
             .iter()
-            .find(|(name, _)| is_ffmpeg_essentials_zip_asset(name))
+            .find(|asset| is_ffmpeg_essentials_zip_asset(&asset.name))
             .cloned()
     });
     let ff_checksum = ff_release.as_ref().and_then(|release| {
         release
             .assets
             .iter()
-            .find(|(name, _)| is_ffmpeg_essentials_checksum_asset(name))
-            .map(|(_, url)| url.clone())
+            .find(|asset| is_ffmpeg_essentials_checksum_asset(&asset.name))
+            .map(|asset| asset.url.clone())
     });
 
     components.push(build_component(
@@ -185,9 +187,10 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         "ffmpeg",
         ffmpeg_local,
         ff_release.as_ref().map(|r| r.tag.clone()),
-        ff_asset.clone().map(|(name, _)| name),
-        ff_asset.clone().map(|(_, url)| url),
+        ff_asset.as_ref().map(|asset| asset.name.clone()),
+        ff_asset.as_ref().map(|asset| asset.url.clone()),
         ff_checksum.clone(),
+        None,
     ));
 
     components.push(build_component(
@@ -195,9 +198,10 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
         "ffprobe",
         ffprobe_local,
         ff_release.as_ref().map(|r| r.tag.clone()),
-        ff_asset.clone().map(|(name, _)| name),
-        ff_asset.map(|(_, url)| url),
+        ff_asset.as_ref().map(|asset| asset.name.clone()),
+        ff_asset.map(|asset| asset.url),
         ff_checksum,
+        None,
     ));
 
     UpdateReport {
@@ -221,17 +225,12 @@ pub fn install_component(
         ComponentKind::YtDlpGui => {
             let target = env::current_exe().map_err(|err| err.to_string())?;
             let staged = staged_app_path(&target)?;
-            let checksum_url = component
-                .checksum_url
+            let digest = component
+                .digest
                 .as_deref()
-                .ok_or_else(|| "SHA256SUMS.txt не найден в релизе".to_string())?;
+                .ok_or_else(|| "SHA-256 digest не найден в GitHub Release".to_string())?;
             download_to_path(&client, download_url, &staged)?;
-            if let Err(err) = verify_checksum_if_present(
-                &client,
-                &staged,
-                Some(checksum_url),
-                asset_name.or(Some(APP_RELEASE_ASSET)),
-            ) {
+            if let Err(err) = verify_github_digest(&staged, digest) {
                 let _ = fs::remove_file(&staged);
                 return Err(err);
             }
@@ -289,6 +288,7 @@ fn build_component(
     asset_name: Option<String>,
     download_url: Option<String>,
     checksum_url: Option<String>,
+    digest: Option<String>,
 ) -> ComponentInfo {
     let status = match (&local_version, &latest_version) {
         (None, Some(_)) => ComponentStatus::Missing,
@@ -315,6 +315,7 @@ fn build_component(
         asset_name,
         download_url,
         checksum_url,
+        digest,
     }
 }
 
@@ -346,7 +347,11 @@ fn fetch_release(client: &Client, api_url: &str) -> Result<ReleaseInfo, String> 
         .filter_map(|asset| {
             let name = asset.get("name")?.as_str()?.to_string();
             let url = asset.get("browser_download_url")?.as_str()?.to_string();
-            Some((name, url))
+            let digest = asset
+                .get("digest")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(ReleaseAsset { name, url, digest })
         })
         .collect::<Vec<_>>();
 
@@ -481,6 +486,25 @@ fn verify_checksum_if_present(
         .unwrap_or_default();
     let expected = parse_checksum(&body, expected_asset_name, fallback_name)
         .ok_or_else(|| "Не удалось извлечь checksum".to_string())?;
+
+    verify_sha256(file_path, &expected)
+}
+
+fn verify_github_digest(file_path: &Path, digest: &str) -> Result<(), String> {
+    let expected = parse_github_sha256(digest)
+        .ok_or_else(|| format!("Неподдерживаемый GitHub digest: {digest}"))?;
+
+    verify_sha256(file_path, expected)
+}
+
+fn parse_github_sha256(digest: &str) -> Option<&str> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|hash| hash.len() == 64 && hash.chars().all(|ch| ch.is_ascii_hexdigit()))
+}
+
+fn verify_sha256(file_path: &Path, expected: &str) -> Result<(), String> {
+    let expected = expected.to_ascii_lowercase();
 
     let mut file = File::open(file_path).map_err(|e| e.to_string())?;
     let mut hasher = Sha256::new();
@@ -670,8 +694,8 @@ start \"\" \"%TARGET%\"\r\n\
 #[cfg(test)]
 mod tests {
     use super::{
-        build_component, parse_checksum, self_update_script, staged_app_path, ComponentKind,
-        ComponentStatus, APP_RELEASE_ASSET,
+        build_component, parse_checksum, parse_github_sha256, self_update_script, staged_app_path,
+        verify_github_digest, ComponentKind, ComponentStatus, APP_RELEASE_ASSET,
     };
     use std::fs;
     use std::path::Path;
@@ -695,6 +719,45 @@ mod tests {
     }
 
     #[test]
+    fn github_digest_requires_a_sha256_value() {
+        let hash = "a".repeat(64);
+
+        assert_eq!(
+            parse_github_sha256(&format!("sha256:{hash}")),
+            Some(hash.as_str())
+        );
+        assert_eq!(parse_github_sha256(&hash), None);
+        assert_eq!(parse_github_sha256("sha512:abc"), None);
+        assert_eq!(parse_github_sha256("sha256:not-a-hash"), None);
+    }
+
+    #[test]
+    fn github_digest_verifies_the_downloaded_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let file_path = std::env::temp_dir().join(format!(
+            "ytdlp-ui-digest-test-{}-{nonce}.exe",
+            std::process::id()
+        ));
+        fs::write(&file_path, []).expect("write test file");
+
+        assert!(verify_github_digest(
+            &file_path,
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+        .is_ok());
+        assert!(verify_github_digest(
+            &file_path,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        )
+        .is_err());
+
+        fs::remove_file(file_path).expect("remove test file");
+    }
+
+    #[test]
     fn gui_release_tags_are_compared_with_the_cargo_version() {
         let current = build_component(
             ComponentKind::YtDlpGui,
@@ -704,12 +767,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let newer = build_component(
             ComponentKind::YtDlpGui,
             "yt-dlp GUI",
             Some("0.1.0".to_string()),
             Some("v0.2.0".to_string()),
+            None,
             None,
             None,
             None,
