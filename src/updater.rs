@@ -3,21 +3,29 @@ use semver::Version;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::env;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const YT_DLP_RELEASES_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
 const FFMPEG_RELEASES_API: &str = "https://api.github.com/repos/GyanD/codexffmpeg/releases/latest";
+const APP_RELEASES_API: &str = "https://api.github.com/repos/amd64fox/ytdlp-ui/releases/latest";
+const APP_RELEASE_ASSET: &str = "ytdlp-ui-x64.exe";
+const APP_CHECKSUM_ASSET: &str = "SHA256SUMS.txt";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const APP_REPOSITORY_URL: &str = "https://github.com/amd64fox/ytdlp-ui";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentKind {
+    YtDlpGui,
     YtDlp,
     Ffmpeg,
     Ffprobe,
+    FfmpegBundle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +57,7 @@ pub struct UpdateReport {
 #[derive(Clone, Debug)]
 pub enum InstallResult {
     Installed(String),
+    RestartRequired(String),
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +78,41 @@ pub fn check_for_updates(app_dir: &Path) -> UpdateReport {
             None
         }
     };
+
+    let app_release =
+        client
+            .as_ref()
+            .and_then(|client| match fetch_release(client, APP_RELEASES_API) {
+                Ok(release) => Some(release),
+                Err(err) => {
+                    warnings.push(format!(">>> Не удалось получить релиз yt-dlp GUI: {err}"));
+                    None
+                }
+            });
+    let app_asset = app_release.as_ref().and_then(|release| {
+        release
+            .assets
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(APP_RELEASE_ASSET))
+            .cloned()
+    });
+    let app_checksum = app_release.as_ref().and_then(|release| {
+        release
+            .assets
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(APP_CHECKSUM_ASSET))
+            .map(|(_, url)| url.clone())
+    });
+
+    components.push(build_component(
+        ComponentKind::YtDlpGui,
+        "yt-dlp GUI",
+        Some(APP_VERSION.to_string()),
+        app_release.as_ref().map(|release| release.tag.clone()),
+        app_asset.clone().map(|(name, _)| name),
+        app_asset.map(|(_, url)| url),
+        app_checksum,
+    ));
 
     let yt_local = read_version_from_binary(&app_dir.join("yt-dlp.exe"), &["--version"]);
     let yt_release =
@@ -174,6 +218,31 @@ pub fn install_component(
     let asset_name = component.asset_name.as_deref();
 
     match component.kind {
+        ComponentKind::YtDlpGui => {
+            let target = env::current_exe().map_err(|err| err.to_string())?;
+            let staged = staged_app_path(&target)?;
+            let checksum_url = component
+                .checksum_url
+                .as_deref()
+                .ok_or_else(|| "SHA256SUMS.txt не найден в релизе".to_string())?;
+            download_to_path(&client, download_url, &staged)?;
+            if let Err(err) = verify_checksum_if_present(
+                &client,
+                &staged,
+                Some(checksum_url),
+                asset_name.or(Some(APP_RELEASE_ASSET)),
+            ) {
+                let _ = fs::remove_file(&staged);
+                return Err(err);
+            }
+            if let Err(err) = schedule_app_replacement(&target, &staged) {
+                let _ = fs::remove_file(&staged);
+                return Err(err);
+            }
+            Ok(InstallResult::RestartRequired(
+                "yt-dlp GUI обновлён, приложение будет перезапущено".to_string(),
+            ))
+        }
         ComponentKind::YtDlp => {
             let target = app_dir.join("yt-dlp.exe");
             let staged = app_dir.join("yt-dlp.exe.tmp");
@@ -187,20 +256,27 @@ pub fn install_component(
             atomic_replace(&staged, &target)?;
             Ok(InstallResult::Installed("yt-dlp обновлён".to_string()))
         }
-        ComponentKind::Ffmpeg | ComponentKind::Ffprobe => {
+        ComponentKind::Ffmpeg | ComponentKind::Ffprobe | ComponentKind::FfmpegBundle => {
             let zip_path = app_dir.join("ffmpeg-release-essentials.zip.tmp");
-            download_to_path(&client, download_url, &zip_path)?;
-            verify_checksum_if_present(
-                &client,
-                &zip_path,
-                component.checksum_url.as_deref(),
-                asset_name,
-            )?;
-            install_ffmpeg_from_zip(&zip_path, app_dir)?;
+            let result = (|| {
+                download_to_path(&client, download_url, &zip_path)?;
+                verify_checksum_if_present(
+                    &client,
+                    &zip_path,
+                    component.checksum_url.as_deref(),
+                    asset_name,
+                )?;
+                install_ffmpeg_from_zip(&zip_path, app_dir, component.kind)
+            })();
             let _ = fs::remove_file(&zip_path);
-            Ok(InstallResult::Installed(
-                "ffmpeg/ffprobe обновлены".to_string(),
-            ))
+            result?;
+            let message = match component.kind {
+                ComponentKind::Ffmpeg => "ffmpeg обновлён",
+                ComponentKind::Ffprobe => "ffprobe обновлён",
+                ComponentKind::FfmpegBundle => "ffmpeg/ffprobe обновлены",
+                ComponentKind::YtDlpGui | ComponentKind::YtDlp => unreachable!(),
+            };
+            Ok(InstallResult::Installed(message.to_string()))
         }
     }
 }
@@ -244,7 +320,7 @@ fn build_component(
 
 fn http_client() -> Result<Client, String> {
     Client::builder()
-        .user_agent("ytdlp-ui-updater")
+        .user_agent(format!("ytdlp-ui/{APP_VERSION}"))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -403,42 +479,7 @@ fn verify_checksum_if_present(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    let expected = body
-        .lines()
-        .find_map(|line| {
-            let l = line.trim();
-            if l.len() < 64 {
-                return None;
-            }
-            let hash = &l[0..64];
-            if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                return None;
-            }
-
-            let name_part = l[64..]
-                .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '*')
-                .trim();
-            let normalized_name = name_part.rsplit(['/', '\\']).next().unwrap_or(name_part);
-            let expected_name = expected_asset_name.unwrap_or(fallback_name);
-
-            if !normalized_name.eq_ignore_ascii_case(expected_name)
-                && (expected_asset_name.is_some()
-                    || !l.to_lowercase().contains(&fallback_name.to_lowercase()))
-            {
-                return None;
-            }
-            Some(hash.to_lowercase())
-        })
-        .or_else(|| {
-            let clean = body.trim();
-            if clean.len() >= 64 {
-                let hash = &clean[0..64];
-                if hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Some(hash.to_lowercase());
-                }
-            }
-            None
-        })
+    let expected = parse_checksum(&body, expected_asset_name, fallback_name)
         .ok_or_else(|| "Не удалось извлечь checksum".to_string())?;
 
     let mut file = File::open(file_path).map_err(|e| e.to_string())?;
@@ -460,6 +501,43 @@ fn verify_checksum_if_present(
     }
 
     Ok(())
+}
+
+fn parse_checksum(
+    manifest: &str,
+    expected_asset_name: Option<&str>,
+    fallback_name: &str,
+) -> Option<String> {
+    let expected_name = expected_asset_name.unwrap_or(fallback_name);
+    let matched = manifest.lines().find_map(|line| {
+        let line = line.trim();
+        if line.len() < 64 {
+            return None;
+        }
+        let hash = &line[..64];
+        if !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+
+        let name_part = line[64..]
+            .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '*')
+            .trim();
+        let normalized_name = name_part.rsplit(['/', '\\']).next().unwrap_or(name_part);
+        normalized_name
+            .eq_ignore_ascii_case(expected_name)
+            .then(|| hash.to_ascii_lowercase())
+    });
+
+    matched.or_else(|| {
+        if expected_asset_name.is_some() {
+            return None;
+        }
+        let clean = manifest.trim();
+        let hash = clean.get(..64)?;
+        hash.chars()
+            .all(|ch| ch.is_ascii_hexdigit())
+            .then(|| hash.to_ascii_lowercase())
+    })
 }
 
 fn atomic_replace(staged_path: &Path, target_path: &Path) -> Result<(), String> {
@@ -484,24 +562,36 @@ fn atomic_replace(staged_path: &Path, target_path: &Path) -> Result<(), String> 
     }
 }
 
-fn install_ffmpeg_from_zip(zip_path: &Path, app_dir: &Path) -> Result<(), String> {
+fn install_ffmpeg_from_zip(
+    zip_path: &Path,
+    app_dir: &Path,
+    component_kind: ComponentKind,
+) -> Result<(), String> {
     let file = File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
+    let install_ffmpeg = matches!(
+        component_kind,
+        ComponentKind::Ffmpeg | ComponentKind::FfmpegBundle
+    );
+    let install_ffprobe = matches!(
+        component_kind,
+        ComponentKind::Ffprobe | ComponentKind::FfmpegBundle
+    );
     let mut ffmpeg_written = false;
     let mut ffprobe_written = false;
 
     for idx in 0..archive.len() {
         let mut entry = archive.by_index(idx).map_err(|e| e.to_string())?;
         let name = entry.name().to_string().to_lowercase();
-        if name.ends_with("bin/ffmpeg.exe") {
+        if install_ffmpeg && name.ends_with("bin/ffmpeg.exe") {
             let staged = app_dir.join("ffmpeg.exe.tmp");
             let mut out = File::create(&staged).map_err(|e| e.to_string())?;
             std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
             atomic_replace(&staged, &app_dir.join("ffmpeg.exe"))?;
             ffmpeg_written = true;
         }
-        if name.ends_with("bin/ffprobe.exe") {
+        if install_ffprobe && name.ends_with("bin/ffprobe.exe") {
             let staged = app_dir.join("ffprobe.exe.tmp");
             let mut out = File::create(&staged).map_err(|e| e.to_string())?;
             std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
@@ -510,9 +600,163 @@ fn install_ffmpeg_from_zip(zip_path: &Path, app_dir: &Path) -> Result<(), String
         }
     }
 
-    if !ffmpeg_written || !ffprobe_written {
-        return Err("ffmpeg.exe или ffprobe.exe не найдены в архиве".to_string());
+    if (install_ffmpeg && !ffmpeg_written) || (install_ffprobe && !ffprobe_written) {
+        return Err("Выбранные компоненты ffmpeg не найдены в архиве".to_string());
     }
 
     Ok(())
+}
+
+fn staged_app_path(current_exe: &Path) -> Result<PathBuf, String> {
+    let file_stem = current_exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| "Не удалось определить имя приложения".to_string())?;
+    Ok(current_exe.with_file_name(format!("{file_stem}.update.exe")))
+}
+
+fn schedule_app_replacement(current_exe: &Path, staged_exe: &Path) -> Result<(), String> {
+    let script_path = current_exe.with_extension("update.cmd");
+    fs::write(&script_path, self_update_script()).map_err(|err| err.to_string())?;
+
+    let result = Command::new(&script_path)
+        .arg(current_exe)
+        .arg(staged_exe)
+        .arg(std::process::id().to_string())
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| err.to_string());
+
+    if result.is_err() {
+        let _ = fs::remove_file(script_path);
+    }
+    result
+}
+
+fn self_update_script() -> &'static str {
+    "@echo off\r\n\
+setlocal\r\n\
+set \"TARGET=%~1\"\r\n\
+set \"STAGED=%~2\"\r\n\
+set \"PID=%~3\"\r\n\
+:wait\r\n\
+tasklist /FI \"PID eq %PID%\" 2>NUL | find \"%PID%\" >NUL\r\n\
+if not errorlevel 1 (\r\n\
+  timeout /T 1 /NOBREAK >NUL\r\n\
+  goto wait\r\n\
+)\r\n\
+set /A ATTEMPTS=0\r\n\
+:replace\r\n\
+move /Y \"%STAGED%\" \"%TARGET%\" >NUL 2>&1\r\n\
+if not errorlevel 1 goto launch\r\n\
+set /A ATTEMPTS+=1\r\n\
+if %ATTEMPTS% GEQ 30 goto failed\r\n\
+timeout /T 1 /NOBREAK >NUL\r\n\
+goto replace\r\n\
+:failed\r\n\
+start \"\" \"%TARGET%\"\r\n\
+exit /B 1\r\n\
+:launch\r\n\
+if /I \"%~4\"==\"--no-launch\" goto cleanup\r\n\
+start \"\" \"%TARGET%\"\r\n\
+:cleanup\r\n\
+(goto) 2>NUL & del \"%~f0\"\r\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_component, parse_checksum, self_update_script, staged_app_path, ComponentKind,
+        ComponentStatus, APP_RELEASE_ASSET,
+    };
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn checksum_requires_the_requested_release_asset() {
+        let wrong_hash = "a".repeat(64);
+        let expected_hash = "B".repeat(64);
+        let manifest = format!("{wrong_hash}  other.exe\n{expected_hash}  {APP_RELEASE_ASSET}\n");
+
+        assert_eq!(
+            parse_checksum(&manifest, Some(APP_RELEASE_ASSET), "ignored.tmp"),
+            Some(expected_hash.to_ascii_lowercase())
+        );
+        assert_eq!(
+            parse_checksum(&manifest, Some("missing.exe"), "ignored.tmp"),
+            None
+        );
+    }
+
+    #[test]
+    fn gui_release_tags_are_compared_with_the_cargo_version() {
+        let current = build_component(
+            ComponentKind::YtDlpGui,
+            "yt-dlp GUI",
+            Some("0.1.0".to_string()),
+            Some("v0.1.0".to_string()),
+            None,
+            None,
+            None,
+        );
+        let newer = build_component(
+            ComponentKind::YtDlpGui,
+            "yt-dlp GUI",
+            Some("0.1.0".to_string()),
+            Some("v0.2.0".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(current.status, ComponentStatus::UpToDate);
+        assert_eq!(newer.status, ComponentStatus::UpdateAvailable);
+    }
+
+    #[test]
+    fn staged_update_stays_next_to_the_running_executable() {
+        assert_eq!(
+            staged_app_path(Path::new(r"C:\Apps\ytdlp-ui.exe")),
+            Ok(Path::new(r"C:\Apps\ytdlp-ui.update.exe").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn self_update_script_replaces_the_staged_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!(
+            "ytdlp-ui-self-update-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&test_dir).expect("create test directory");
+
+        let target = test_dir.join("app.exe");
+        let staged = test_dir.join("app.update.exe");
+        let script = test_dir.join("app.update.cmd");
+        fs::write(&target, b"old").expect("write target");
+        fs::write(&staged, b"new").expect("write staged update");
+        fs::write(&script, self_update_script()).expect("write update script");
+
+        let status = Command::new(&script)
+            .arg(&target)
+            .arg(&staged)
+            .arg("4294967294")
+            .arg("--no-launch")
+            .status()
+            .expect("run update script");
+
+        assert!(status.success());
+        assert_eq!(fs::read(&target).expect("read replaced target"), b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(&test_dir).expect("remove test directory");
+    }
 }
