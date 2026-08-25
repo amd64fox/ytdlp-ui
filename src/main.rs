@@ -37,6 +37,8 @@ const AUDIO_MP3_PROFILE_ID: &str = "builtin.audio_mp3";
 const AUDIO_M4A_PROFILE_ID: &str = "builtin.audio_m4a";
 const LEGACY_PROFILE_ID: &str = "custom.legacy";
 const DOWNLOAD_ARCHIVE_FILE: &str = "download-archive.txt";
+const YT_DLP_PROGRESS_PREFIX: &str = "__YTDLP_UI_PROGRESS__|";
+const YT_DLP_PROGRESS_TEMPLATE: &str = "download:__YTDLP_UI_PROGRESS__|%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s|%(progress._eta_str)s";
 const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\consola.ttf",
     r"C:\Windows\Fonts\CascadiaMono.ttf",
@@ -785,9 +787,62 @@ impl AppConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DownloadProgress {
+    fraction: f32,
+    percent: String,
+    detail: String,
+}
+
+fn parse_yt_dlp_progress(line: &str) -> Option<DownloadProgress> {
+    let payload = line.trim().strip_prefix(YT_DLP_PROGRESS_PREFIX)?;
+    let mut fields = payload.splitn(5, '|');
+    let percent_field = fields.next()?.trim();
+    let downloaded = progress_value(fields.next()?);
+    let total = progress_value(fields.next()?);
+    let speed = progress_value(fields.next()?);
+    let eta = progress_value(fields.next()?);
+
+    let fraction_percent = percent_field
+        .trim_end_matches('%')
+        .trim()
+        .replace(',', ".")
+        .parse::<f32>()
+        .ok()?;
+    if !(0.0..=100.0).contains(&fraction_percent) {
+        return None;
+    }
+
+    let mut details = Vec::new();
+    match (downloaded, total) {
+        (Some(downloaded), Some(total)) => details.push(format!("{downloaded} / {total}")),
+        (Some(downloaded), None) => details.push(downloaded.to_string()),
+        (None, Some(total)) => details.push(total.to_string()),
+        (None, None) => {}
+    }
+    if let Some(speed) = speed {
+        details.push(speed.to_string());
+    }
+    if let Some(eta) = eta {
+        details.push(format!("осталось {eta}"));
+    }
+
+    Some(DownloadProgress {
+        fraction: fraction_percent / 100.0,
+        percent: format!("{fraction_percent:.1}%"),
+        detail: details.join(" · "),
+    })
+}
+
+fn progress_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && !matches!(value, "NA" | "N/A" | "Unknown")).then_some(value)
+}
+
 enum AppMessage {
     Log(String),
     Status(StatusMessage),
+    DownloadProgress(Option<DownloadProgress>),
     UpdateSnapshot(Vec<updater::ComponentInfo>),
     UpdatingComponent(Option<updater::ComponentKind>),
     AllFinished(FinishState),
@@ -1174,6 +1229,7 @@ struct YtDlpApp {
     config: AppConfig,
     logs: String,
     status: StatusMessage,
+    download_progress: Option<DownloadProgress>,
 
     is_working: bool,
     show_logs: bool,
@@ -1277,6 +1333,13 @@ impl YtDlpApp {
                         }
 
                         let line = Self::decode_process_line(&buffer);
+                        if prefix.is_empty() {
+                            if let Some(progress) = parse_yt_dlp_progress(&line) {
+                                let _ = sender.send(AppMessage::DownloadProgress(Some(progress)));
+                                ctx.request_repaint();
+                                continue;
+                            }
+                        }
                         let rendered = if prefix.is_empty() {
                             line
                         } else {
@@ -1429,6 +1492,7 @@ impl YtDlpApp {
             config,
             logs,
             status,
+            download_progress: None,
             is_working: false,
             show_logs: false,
             show_url_editor: false,
@@ -1551,6 +1615,7 @@ impl YtDlpApp {
             return;
         }
         self.is_working = true;
+        self.download_progress = None;
         self.logs.clear();
         let total = valid_urls.len();
         self.logs
@@ -1573,6 +1638,7 @@ impl YtDlpApp {
             let mut had_error = false;
             let mut last_error = None;
             for (i, url) in valid_urls.iter().enumerate() {
+                let _ = sender.send(AppMessage::DownloadProgress(None));
                 Self::send_status(
                     &sender,
                     &thread_ctx,
@@ -1588,8 +1654,15 @@ impl YtDlpApp {
                     &thread_ctx,
                     format!(">>> [{}/{}] {}", i + 1, total, url),
                 );
-                let mut args = vec!["--newline".to_string()];
-                args.extend(config_args.iter().cloned());
+                let mut args = config_args.clone();
+                args.extend([
+                    "--newline".to_string(),
+                    "--progress".to_string(),
+                    "--progress-delta".to_string(),
+                    "0.2".to_string(),
+                    "--progress-template".to_string(),
+                    YT_DLP_PROGRESS_TEMPLATE.to_string(),
+                ]);
                 args.push("-o".to_string());
                 args.push(output_template.clone());
                 args.push(url.clone());
@@ -1710,6 +1783,8 @@ impl YtDlpApp {
                         );
                     }
                 }
+                let _ = sender.send(AppMessage::DownloadProgress(None));
+                thread_ctx.request_repaint();
             }
             let finish = if had_error {
                 FinishState {
@@ -1743,6 +1818,7 @@ impl YtDlpApp {
             return;
         }
         self.is_working = true;
+        self.download_progress = None;
         let total = to_update.len();
         self.status = StatusMessage::new(
             StatusTone::Running,
@@ -1992,7 +2068,20 @@ impl YtDlpApp {
                     }
                 });
 
-                if !self.status.detail.is_empty() {
+                if let Some(progress) = &self.download_progress {
+                    ui.add_space(4.0);
+                    let text = if progress.detail.is_empty() {
+                        progress.percent.clone()
+                    } else {
+                        format!("{} · {}", progress.percent, progress.detail)
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(progress.fraction)
+                            .desired_width(ui.available_width())
+                            .text(text),
+                    )
+                    .on_hover_text(&self.status.detail);
+                } else if !self.status.detail.is_empty() {
                     ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
@@ -3601,6 +3690,9 @@ impl eframe::App for YtDlpApp {
                 AppMessage::Status(status) => {
                     self.status = status;
                 }
+                AppMessage::DownloadProgress(progress) => {
+                    self.download_progress = progress;
+                }
                 AppMessage::UpdateSnapshot(states) => {
                     self.component_states = states;
                 }
@@ -3609,6 +3701,7 @@ impl eframe::App for YtDlpApp {
                 }
                 AppMessage::AllFinished(finish) => {
                     self.is_working = false;
+                    self.download_progress = None;
                     let restart_required = finish.restart_required;
                     self.status = StatusMessage::new(
                         if finish.had_error {
@@ -4149,10 +4242,11 @@ impl eframe::App for YtDlpApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_theme, builtin_profile_by_id, preserve_text_selection_for_context_menu,
-        restore_text_selection, selected_text, selected_update_targets, AppConfig, AudioFormat,
-        DownloadKind, DownloadProfile, FileNameTemplate, NativeTitleBarStyle, ThemeMode, UiTheme,
-        AUDIO_MP3_PROFILE_ID, MP4_1080_PROFILE_ID, NATIVE_COLOR_DEFAULT, NO_SPONSORS_PROFILE_ID,
+        apply_theme, builtin_profile_by_id, parse_yt_dlp_progress,
+        preserve_text_selection_for_context_menu, restore_text_selection, selected_text,
+        selected_update_targets, AppConfig, AudioFormat, DownloadKind, DownloadProfile,
+        FileNameTemplate, NativeTitleBarStyle, ThemeMode, UiTheme, AUDIO_MP3_PROFILE_ID,
+        MP4_1080_PROFILE_ID, NATIVE_COLOR_DEFAULT, NO_SPONSORS_PROFILE_ID,
     };
     use super::{YtDlpApp, RAW_PROFILE_ID};
     use crate::egui;
@@ -4180,6 +4274,32 @@ mod tests {
             YtDlpApp::extract_yt_dlp_error_line("[download] 42.0% of 12.00MiB"),
             None
         );
+    }
+
+    #[test]
+    fn parses_yt_dlp_progress_template() {
+        let progress =
+            parse_yt_dlp_progress("__YTDLP_UI_PROGRESS__| 42.3%|12.00MiB|28.00MiB|1.50MiB/s|00:10")
+                .unwrap();
+
+        assert!((progress.fraction - 0.423).abs() < 0.0001);
+        assert_eq!(progress.percent, "42.3%");
+        assert_eq!(
+            progress.detail,
+            "12.00MiB / 28.00MiB · 1.50MiB/s · осталось 00:10"
+        );
+    }
+
+    #[test]
+    fn parses_progress_with_missing_optional_values() {
+        let progress =
+            parse_yt_dlp_progress("__YTDLP_UI_PROGRESS__|100,0%|8.00MiB|N/A|NA|Unknown").unwrap();
+
+        assert_eq!(progress.fraction, 1.0);
+        assert_eq!(progress.percent, "100.0%");
+        assert_eq!(progress.detail, "8.00MiB");
+        assert!(parse_yt_dlp_progress("[download] 42.0% of 12.00MiB").is_none());
+        assert!(parse_yt_dlp_progress("__YTDLP_UI_PROGRESS__|101%||||").is_none());
     }
 
     #[test]
