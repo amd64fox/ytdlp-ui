@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 const CONFIG_FILE: &str = "config.toml";
 const APP_CONFIG_DIR: &str = "ytdlp-ui";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const COMPACT_WINDOW_SIZE: [f32; 2] = [500.0, 476.0];
-const LOG_WINDOW_SIZE: [f32; 2] = [500.0, 676.0];
+const MAIN_WINDOW_SIZE: [f32; 2] = [500.0, 356.0];
+const PAGE_WINDOW_SIZE: [f32; 2] = [500.0, 476.0];
+const LOG_WINDOW_SIZE: [f32; 2] = [500.0, 556.0];
 const LOG_AREA_HEIGHT: f32 = 160.0;
-const COMPONENT_LIST_HEIGHT: f32 = 82.0;
 const ICON_STROKE_WIDTH: f32 = 1.2;
 const NATIVE_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
 const RAW_PROFILE_ID: &str = "builtin.raw";
@@ -37,8 +37,6 @@ const AUDIO_MP3_PROFILE_ID: &str = "builtin.audio_mp3";
 const AUDIO_M4A_PROFILE_ID: &str = "builtin.audio_m4a";
 const LEGACY_PROFILE_ID: &str = "custom.legacy";
 const DOWNLOAD_ARCHIVE_FILE: &str = "download-archive.txt";
-const YT_DLP_PROGRESS_PREFIX: &str = "__YTDLP_UI_PROGRESS__|";
-const YT_DLP_PROGRESS_TEMPLATE: &str = "download:__YTDLP_UI_PROGRESS__|%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_str)s|%(progress._speed_str)s|%(progress._eta_str)s";
 const WINDOWS_MONOSPACE_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\consola.ttf",
     r"C:\Windows\Fonts\CascadiaMono.ttf",
@@ -787,62 +785,9 @@ impl AppConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct DownloadProgress {
-    fraction: f32,
-    percent: String,
-    detail: String,
-}
-
-fn parse_yt_dlp_progress(line: &str) -> Option<DownloadProgress> {
-    let payload = line.trim().strip_prefix(YT_DLP_PROGRESS_PREFIX)?;
-    let mut fields = payload.splitn(5, '|');
-    let percent_field = fields.next()?.trim();
-    let downloaded = progress_value(fields.next()?);
-    let total = progress_value(fields.next()?);
-    let speed = progress_value(fields.next()?);
-    let eta = progress_value(fields.next()?);
-
-    let fraction_percent = percent_field
-        .trim_end_matches('%')
-        .trim()
-        .replace(',', ".")
-        .parse::<f32>()
-        .ok()?;
-    if !(0.0..=100.0).contains(&fraction_percent) {
-        return None;
-    }
-
-    let mut details = Vec::new();
-    match (downloaded, total) {
-        (Some(downloaded), Some(total)) => details.push(format!("{downloaded} / {total}")),
-        (Some(downloaded), None) => details.push(downloaded.to_string()),
-        (None, Some(total)) => details.push(total.to_string()),
-        (None, None) => {}
-    }
-    if let Some(speed) = speed {
-        details.push(speed.to_string());
-    }
-    if let Some(eta) = eta {
-        details.push(format!("осталось {eta}"));
-    }
-
-    Some(DownloadProgress {
-        fraction: fraction_percent / 100.0,
-        percent: format!("{fraction_percent:.1}%"),
-        detail: details.join(" · "),
-    })
-}
-
-fn progress_value(value: &str) -> Option<&str> {
-    let value = value.trim();
-    (!value.is_empty() && !matches!(value, "NA" | "N/A" | "Unknown")).then_some(value)
-}
-
 enum AppMessage {
     Log(String),
     Status(StatusMessage),
-    DownloadProgress(Option<DownloadProgress>),
     UpdateSnapshot(Vec<updater::ComponentInfo>),
     UpdatingComponent(Option<updater::ComponentKind>),
     AllFinished(FinishState),
@@ -1229,7 +1174,6 @@ struct YtDlpApp {
     config: AppConfig,
     logs: String,
     status: StatusMessage,
-    download_progress: Option<DownloadProgress>,
 
     is_working: bool,
     show_logs: bool,
@@ -1333,13 +1277,6 @@ impl YtDlpApp {
                         }
 
                         let line = Self::decode_process_line(&buffer);
-                        if prefix.is_empty() {
-                            if let Some(progress) = parse_yt_dlp_progress(&line) {
-                                let _ = sender.send(AppMessage::DownloadProgress(Some(progress)));
-                                ctx.request_repaint();
-                                continue;
-                            }
-                        }
                         let rendered = if prefix.is_empty() {
                             line
                         } else {
@@ -1492,7 +1429,6 @@ impl YtDlpApp {
             config,
             logs,
             status,
-            download_progress: None,
             is_working: false,
             show_logs: false,
             show_url_editor: false,
@@ -1615,7 +1551,6 @@ impl YtDlpApp {
             return;
         }
         self.is_working = true;
-        self.download_progress = None;
         self.logs.clear();
         let total = valid_urls.len();
         self.logs
@@ -1638,7 +1573,6 @@ impl YtDlpApp {
             let mut had_error = false;
             let mut last_error = None;
             for (i, url) in valid_urls.iter().enumerate() {
-                let _ = sender.send(AppMessage::DownloadProgress(None));
                 Self::send_status(
                     &sender,
                     &thread_ctx,
@@ -1654,15 +1588,8 @@ impl YtDlpApp {
                     &thread_ctx,
                     format!(">>> [{}/{}] {}", i + 1, total, url),
                 );
-                let mut args = config_args.clone();
-                args.extend([
-                    "--newline".to_string(),
-                    "--progress".to_string(),
-                    "--progress-delta".to_string(),
-                    "0.2".to_string(),
-                    "--progress-template".to_string(),
-                    YT_DLP_PROGRESS_TEMPLATE.to_string(),
-                ]);
+                let mut args = vec!["--newline".to_string()];
+                args.extend(config_args.iter().cloned());
                 args.push("-o".to_string());
                 args.push(output_template.clone());
                 args.push(url.clone());
@@ -1783,8 +1710,6 @@ impl YtDlpApp {
                         );
                     }
                 }
-                let _ = sender.send(AppMessage::DownloadProgress(None));
-                thread_ctx.request_repaint();
             }
             let finish = if had_error {
                 FinishState {
@@ -1818,7 +1743,6 @@ impl YtDlpApp {
             return;
         }
         self.is_working = true;
-        self.download_progress = None;
         let total = to_update.len();
         self.status = StatusMessage::new(
             StatusTone::Running,
@@ -1938,13 +1862,13 @@ impl YtDlpApp {
                 (visuals.error_fg_color, "не установлен".to_string())
             }
             updater::ComponentStatus::UpdateAvailable => {
-                (visuals.warn_fg_color, "update available".to_string())
+                (visuals.warn_fg_color, "доступно обновление".to_string())
             }
             updater::ComponentStatus::UpToDate => {
                 (UiTheme::for_ui(ui).success, "актуален".to_string())
             }
             updater::ComponentStatus::Unknown => {
-                (UiTheme::for_ui(ui).secondary_text, "unknown".to_string())
+                (UiTheme::for_ui(ui).secondary_text, "неизвестно".to_string())
             }
         }
     }
@@ -2030,7 +1954,7 @@ impl YtDlpApp {
         let size = if show_logs {
             LOG_WINDOW_SIZE
         } else {
-            COMPACT_WINDOW_SIZE
+            MAIN_WINDOW_SIZE
         };
         Self::apply_window_size(ctx, size);
     }
@@ -2068,20 +1992,7 @@ impl YtDlpApp {
                     }
                 });
 
-                if let Some(progress) = &self.download_progress {
-                    ui.add_space(4.0);
-                    let text = if progress.detail.is_empty() {
-                        progress.percent.clone()
-                    } else {
-                        format!("{} · {}", progress.percent, progress.detail)
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(progress.fraction)
-                            .desired_width(ui.available_width())
-                            .text(text),
-                    )
-                    .on_hover_text(&self.status.detail);
-                } else if !self.status.detail.is_empty() {
+                if !self.status.detail.is_empty() {
                     ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
@@ -3497,10 +3408,32 @@ impl YtDlpApp {
                 ui.heading("YouTube Downloader");
                 ui.label(format!("Версия {}", updater::APP_VERSION));
                 ui.add_space(4.0);
-                ui.hyperlink_to("GitHub", updater::APP_REPOSITORY_URL);
+                ui.hyperlink_to("github.com/amd64fox/ytdlp-ui", updater::APP_REPOSITORY_URL)
+                    .on_hover_text("Открыть репозиторий GitHub");
             });
 
         ui.add_space(10.0);
+        let update_candidates = self.update_candidates();
+        let update_enabled =
+            !self.is_working && !self.component_states.is_empty() && !update_candidates.is_empty();
+        let update_tooltip = if self.component_states.is_empty() {
+            "Проверка обновлений"
+        } else if self.is_working {
+            "Дождитесь завершения текущей операции"
+        } else if update_candidates.is_empty() {
+            if self
+                .component_states
+                .iter()
+                .all(|component| component.status == updater::ComponentStatus::UpToDate)
+            {
+                "Все компоненты актуальны"
+            } else {
+                "Нет доступных обновлений"
+            }
+        } else {
+            "Обновить компоненты"
+        };
+        let mut update_clicked = false;
         egui::Frame::new()
             .fill(palette.group_bg)
             .stroke(egui::Stroke::new(1.0, palette.stroke))
@@ -3508,11 +3441,27 @@ impl YtDlpApp {
             .corner_radius(4.0)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    egui::RichText::new("Версии компонентов")
-                        .strong()
-                        .color(UiTheme::for_ui(ui).secondary_text),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Компоненты")
+                            .strong()
+                            .color(UiTheme::for_ui(ui).secondary_text),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let response = ui
+                            .add_enabled_ui(update_enabled, |ui| {
+                                Self::draw_button_with_icon(
+                                    ui,
+                                    "Обновить",
+                                    egui::vec2(112.0, 28.0),
+                                    Self::paint_refresh_icon,
+                                )
+                            })
+                            .inner
+                            .on_hover_text(update_tooltip);
+                        update_clicked = response.clicked();
+                    });
+                });
                 ui.add_space(8.0);
 
                 if self.component_states.is_empty() {
@@ -3543,6 +3492,15 @@ impl YtDlpApp {
                         }
                     });
             });
+
+        if update_clicked {
+            self.selected_update_components = update_candidates
+                .iter()
+                .map(|component| component.kind)
+                .collect();
+            self.show_update_confirm = true;
+            self.center_confirm_window_on_open = true;
+        }
     }
 
     fn draw_url_editor(&mut self, ui: &mut egui::Ui) {
@@ -3690,9 +3648,6 @@ impl eframe::App for YtDlpApp {
                 AppMessage::Status(status) => {
                     self.status = status;
                 }
-                AppMessage::DownloadProgress(progress) => {
-                    self.download_progress = progress;
-                }
                 AppMessage::UpdateSnapshot(states) => {
                     self.component_states = states;
                 }
@@ -3701,7 +3656,6 @@ impl eframe::App for YtDlpApp {
                 }
                 AppMessage::AllFinished(finish) => {
                     self.is_working = false;
-                    self.download_progress = None;
                     let restart_required = finish.restart_required;
                     self.status = StatusMessage::new(
                         if finish.had_error {
@@ -3761,7 +3715,7 @@ impl eframe::App for YtDlpApp {
                     .clicked()
                     {
                         self.show_settings = true;
-                        Self::apply_window_size(&ctx, COMPACT_WINDOW_SIZE);
+                        Self::apply_window_size(&ctx, PAGE_WINDOW_SIZE);
                     }
 
                     ui.add_space(6.0);
@@ -3774,38 +3728,11 @@ impl eframe::App for YtDlpApp {
                     .clicked()
                     {
                         self.show_about = true;
-                        Self::apply_window_size(&ctx, COMPACT_WINDOW_SIZE);
+                        Self::apply_window_size(&ctx, PAGE_WINDOW_SIZE);
                     }
 
                     ui.add_space(6.0);
                     self.draw_theme_selector(&ctx, ui);
-                    ui.add_space(6.0);
-
-                    if !self.is_working
-                        && Self::draw_icon_only_button(
-                            ui,
-                            egui::vec2(30.0, 30.0),
-                            Self::paint_refresh_icon,
-                        )
-                        .on_hover_text("Обновить")
-                        .clicked()
-                    {
-                        let candidates = self.update_candidates();
-                        if candidates.is_empty() {
-                            self.logs.push_str(">>> Нет доступных обновлений.\n");
-                            self.status = StatusMessage::new(
-                                StatusTone::Success,
-                                "Обновления не требуются",
-                                "Все компоненты уже актуальны",
-                                None,
-                            );
-                        } else {
-                            self.selected_update_components =
-                                candidates.iter().map(|component| component.kind).collect();
-                            self.show_update_confirm = true;
-                            self.center_confirm_window_on_open = true;
-                        }
-                    }
                 });
             });
 
@@ -3887,69 +3814,6 @@ impl eframe::App for YtDlpApp {
 
             ui.add_space(10.0);
 
-            egui::Frame::new()
-                .fill(palette.group_bg)
-                .stroke(egui::Stroke::new(1.0, palette.stroke))
-                .inner_margin(8.0)
-                .corner_radius(4.0)
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        egui::RichText::new("Состояние компонентов")
-                            .strong()
-                            .color(UiTheme::for_ui(ui).secondary_text),
-                    );
-
-                    ui.add_space(4.0);
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), COMPONENT_LIST_HEIGHT),
-                        egui::Sense::hover(),
-                    );
-                    let mut list_ui = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(rect)
-                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                    );
-
-                    if self.component_states.is_empty() {
-                        for row in 0..4 {
-                            Self::draw_component_skeleton_row(&mut list_ui, row);
-                        }
-                    } else {
-                        for component in &self.component_states {
-                            let (color, status_text) = self.component_badge(&list_ui, component);
-                            list_ui.horizontal(|ui| {
-                                Self::draw_status_dot(ui, color);
-                                let title = egui::RichText::new(&component.title).strong();
-                                if component.status == updater::ComponentStatus::UpToDate {
-                                    ui.label(title);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            component.local_version.as_deref().unwrap_or("?"),
-                                        )
-                                        .weak(),
-                                    );
-                                } else if component.status == updater::ComponentStatus::Missing {
-                                    ui.label(title);
-                                    ui.label(
-                                        egui::RichText::new(status_text)
-                                            .color(ui.visuals().error_fg_color),
-                                    );
-                                } else {
-                                    ui.label(title);
-                                    ui.label(format!(
-                                        "{} -> {}",
-                                        component.local_version.as_deref().unwrap_or("?"),
-                                        component.latest_version.as_deref().unwrap_or("?")
-                                    ));
-                                }
-                            });
-                        }
-                    }
-                });
-
-            ui.add_space(10.0);
-
             ui.horizontal(|ui| {
                 if !self.is_working {
                     let downloader_ready = self.managed_yt_dlp_path().is_file();
@@ -3974,7 +3838,8 @@ impl eframe::App for YtDlpApp {
 
                     if !downloader_ready && !is_checking {
                         ui.label(
-                            egui::RichText::new("Сначала установите yt-dlp через Обновить.").weak(),
+                            egui::RichText::new("Установите yt-dlp в разделе «О программе».")
+                                .weak(),
                         );
                     }
                 } else {
@@ -4242,11 +4107,10 @@ impl eframe::App for YtDlpApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_theme, builtin_profile_by_id, parse_yt_dlp_progress,
-        preserve_text_selection_for_context_menu, restore_text_selection, selected_text,
-        selected_update_targets, AppConfig, AudioFormat, DownloadKind, DownloadProfile,
-        FileNameTemplate, NativeTitleBarStyle, ThemeMode, UiTheme, AUDIO_MP3_PROFILE_ID,
-        MP4_1080_PROFILE_ID, NATIVE_COLOR_DEFAULT, NO_SPONSORS_PROFILE_ID,
+        apply_theme, builtin_profile_by_id, preserve_text_selection_for_context_menu,
+        restore_text_selection, selected_text, selected_update_targets, AppConfig, AudioFormat,
+        DownloadKind, DownloadProfile, FileNameTemplate, NativeTitleBarStyle, ThemeMode, UiTheme,
+        AUDIO_MP3_PROFILE_ID, MP4_1080_PROFILE_ID, NATIVE_COLOR_DEFAULT, NO_SPONSORS_PROFILE_ID,
     };
     use super::{YtDlpApp, RAW_PROFILE_ID};
     use crate::egui;
@@ -4274,32 +4138,6 @@ mod tests {
             YtDlpApp::extract_yt_dlp_error_line("[download] 42.0% of 12.00MiB"),
             None
         );
-    }
-
-    #[test]
-    fn parses_yt_dlp_progress_template() {
-        let progress =
-            parse_yt_dlp_progress("__YTDLP_UI_PROGRESS__| 42.3%|12.00MiB|28.00MiB|1.50MiB/s|00:10")
-                .unwrap();
-
-        assert!((progress.fraction - 0.423).abs() < 0.0001);
-        assert_eq!(progress.percent, "42.3%");
-        assert_eq!(
-            progress.detail,
-            "12.00MiB / 28.00MiB · 1.50MiB/s · осталось 00:10"
-        );
-    }
-
-    #[test]
-    fn parses_progress_with_missing_optional_values() {
-        let progress =
-            parse_yt_dlp_progress("__YTDLP_UI_PROGRESS__|100,0%|8.00MiB|N/A|NA|Unknown").unwrap();
-
-        assert_eq!(progress.fraction, 1.0);
-        assert_eq!(progress.percent, "100.0%");
-        assert_eq!(progress.detail, "8.00MiB");
-        assert!(parse_yt_dlp_progress("[download] 42.0% of 12.00MiB").is_none());
-        assert!(parse_yt_dlp_progress("__YTDLP_UI_PROGRESS__|101%||||").is_none());
     }
 
     #[test]
@@ -4819,9 +4657,9 @@ yt_dlp_args = [
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(COMPACT_WINDOW_SIZE)
-            .with_min_inner_size(COMPACT_WINDOW_SIZE)
-            .with_max_inner_size(COMPACT_WINDOW_SIZE)
+            .with_inner_size(MAIN_WINDOW_SIZE)
+            .with_min_inner_size(MAIN_WINDOW_SIZE)
+            .with_max_inner_size(MAIN_WINDOW_SIZE)
             .with_resizable(false)
             .with_maximize_button(false),
         centered: true,
